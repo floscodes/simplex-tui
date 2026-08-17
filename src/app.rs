@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::{cell::Cell, sync::mpsc};
+use std::{cell::Cell, collections::HashMap, sync::mpsc};
 
 use crate::event::{AppEvent, Event, EventHandler};
 use crate::{
@@ -71,6 +71,7 @@ pub struct App {
     pub(crate) jump_to_latest_area: Cell<Rect>,
     pub(crate) max_chat_scroll: Cell<usize>,
     pub events: EventHandler,
+    message_cache: HashMap<ChatRef, Vec<Message>>,
     simplex_events: mpsc::Receiver<SimplexEvent>,
     simplex_commands: mpsc::Sender<SimplexCommand>,
 }
@@ -113,6 +114,7 @@ impl Default for App {
             jump_to_latest_area: Cell::new(Rect::default()),
             max_chat_scroll: Cell::new(0),
             events: EventHandler::new(),
+            message_cache: HashMap::new(),
             simplex_events,
             simplex_commands,
         }
@@ -182,6 +184,7 @@ impl App {
                     self.startup = StartupState::Loading;
                     self.chats.clear();
                     self.messages.clear();
+                    self.message_cache.clear();
                     self.loaded_chat = None;
                     let _ = self
                         .simplex_commands
@@ -414,6 +417,10 @@ impl App {
                 || previous_chat.as_ref() != self.selected_chat_ref())
         {
             self.jump_to_latest();
+            self.loaded_chat = None;
+            self.messages.clear();
+            self.chat_loading = false;
+            self.chat_error = None;
         }
     }
 
@@ -449,6 +456,7 @@ impl App {
                     self.startup = StartupState::Ready(user);
                     self.chats = chats;
                     self.messages.clear();
+                    self.message_cache.clear();
                     self.loaded_chat = None;
                     self.invitation_link = None;
                     self.invitation_error = None;
@@ -467,6 +475,7 @@ impl App {
                     self.profiles = profiles;
                     self.chats = chats;
                     self.messages.clear();
+                    self.message_cache.clear();
                     self.loaded_chat = None;
                     self.invitation_link = None;
                     self.invitation_error = None;
@@ -486,8 +495,25 @@ impl App {
                     self.invitation_loading = false;
                     self.invitation_error = Some(error);
                 }
-                SimplexEvent::ChatLoaded { chat_ref, messages } => {
+                SimplexEvent::ChatLoaded {
+                    chat_ref,
+                    mut messages,
+                } => {
                     if self.selected_chat_ref() == Some(&chat_ref) {
+                        if let Some(cached) = self.message_cache.get(&chat_ref) {
+                            for message in cached {
+                                if !messages.iter().any(|item| item.id == message.id) {
+                                    messages.push(message.clone());
+                                }
+                            }
+                        }
+                        messages.sort_by(|left, right| {
+                            left.timestamp
+                                .cmp(&right.timestamp)
+                                .then(left.id.cmp(&right.id))
+                        });
+                        self.message_cache
+                            .insert(chat_ref.clone(), messages.clone());
                         self.loaded_chat = Some(chat_ref);
                         self.chat_loading = false;
                         self.messages = messages;
@@ -502,6 +528,24 @@ impl App {
                         chat.unread_count = 0;
                     }
                 }
+                SimplexEvent::ContactConnected { chats, chat_ref } => {
+                    self.chats = chats;
+                    self.section = Section::Chats;
+                    self.selected_chat = self
+                        .chats
+                        .iter()
+                        .position(|chat| chat.chat_ref == chat_ref)
+                        .unwrap_or(0);
+                    self.loaded_chat = None;
+                    self.messages.clear();
+                    self.chat_loading = false;
+                    self.chat_error = None;
+                    self.invitation_link = None;
+                    self.invitation_loading = false;
+                    self.invitation_error = None;
+                    self.jump_to_latest();
+                    self.notice = Some("Contact connected".into());
+                }
                 SimplexEvent::MessageReceived { chat_ref, message } => {
                     let chat_is_visible = self.section == Section::Chats
                         && self.selected_chat_ref() == Some(&chat_ref)
@@ -509,7 +553,8 @@ impl App {
                         && !self.chat_loading;
                     if chat_is_visible {
                         if !self.messages.iter().any(|item| item.id == message.id) {
-                            self.messages.push(message);
+                            self.messages.push(message.clone());
+                            cache_message(&mut self.message_cache, &chat_ref, message);
                             self.chat_scroll = self.chat_scroll.saturating_add(1);
                             self.new_messages_below = self.new_messages_below.saturating_add(1);
                             if let Some(chat) =
@@ -518,10 +563,13 @@ impl App {
                                 chat.unread_count = chat.unread_count.saturating_add(1);
                             }
                         }
-                    } else if let Some(chat) =
-                        self.chats.iter_mut().find(|chat| chat.chat_ref == chat_ref)
-                    {
-                        chat.unread_count += 1;
+                    } else {
+                        if let Some(chat) =
+                            self.chats.iter_mut().find(|chat| chat.chat_ref == chat_ref)
+                        {
+                            chat.unread_count += 1;
+                        }
+                        cache_message(&mut self.message_cache, &chat_ref, message);
                     }
                 }
                 SimplexEvent::ChatLoadFailed { chat_ref, error } => {
@@ -763,6 +811,18 @@ impl App {
     }
 }
 
+fn cache_message(cache: &mut HashMap<ChatRef, Vec<Message>>, chat_ref: &ChatRef, message: Message) {
+    let messages = cache.entry(chat_ref.clone()).or_default();
+    if !messages.iter().any(|item| item.id == message.id) {
+        messages.push(message);
+        messages.sort_by(|left, right| {
+            left.timestamp
+                .cmp(&right.timestamp)
+                .then(left.id.cmp(&right.id))
+        });
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -905,6 +965,17 @@ mod tests {
 
         assert_eq!(app.chats[0].unread_count, 1);
         assert!(app.messages.is_empty());
+
+        app.handle_app_event(AppEvent::SelectSection(Section::Chats));
+        assert_eq!(app.loaded_chat, None);
+        event_sender
+            .send(SimplexEvent::ChatLoaded {
+                chat_ref: ChatRef("@7".into()),
+                messages: Vec::new(),
+            })
+            .unwrap();
+        app.tick();
+        assert_eq!(app.messages[0].text, "hello");
     }
 
     #[tokio::test]
@@ -929,5 +1000,63 @@ mod tests {
             panic!("expected mark-read command")
         };
         assert_eq!(chat_ref, ChatRef("@7".into()));
+    }
+
+    #[tokio::test]
+    async fn message_received_in_background_is_merged_when_chat_opens() {
+        let (event_sender, event_receiver) = mpsc::channel();
+        let mut app = App {
+            section: Section::Chats,
+            selected_chat: 0,
+            chats: vec![
+                ChatSummary {
+                    chat_ref: ChatRef("@1".into()),
+                    display_name: "alice".into(),
+                    unread_count: 0,
+                },
+                ChatSummary {
+                    chat_ref: ChatRef("@2".into()),
+                    display_name: "bob".into(),
+                    unread_count: 0,
+                },
+            ],
+            loaded_chat: Some(ChatRef("@1".into())),
+            simplex_events: event_receiver,
+            ..App::default()
+        };
+        let message = Message {
+            id: 42,
+            text: "from background".into(),
+            timestamp: String::new(),
+            outgoing: false,
+        };
+        event_sender
+            .send(SimplexEvent::MessageReceived {
+                chat_ref: ChatRef("@2".into()),
+                message: message.clone(),
+            })
+            .unwrap();
+        app.tick();
+        assert_eq!(app.chats[1].unread_count, 1);
+
+        app.selected_chat = 1;
+        event_sender
+            .send(SimplexEvent::ChatLoaded {
+                chat_ref: ChatRef("@2".into()),
+                messages: Vec::new(),
+            })
+            .unwrap();
+        app.tick();
+
+        assert_eq!(app.messages, vec![message]);
+
+        event_sender
+            .send(SimplexEvent::ChatLoaded {
+                chat_ref: ChatRef("@2".into()),
+                messages: Vec::new(),
+            })
+            .unwrap();
+        app.tick();
+        assert_eq!(app.messages[0].text, "from background");
     }
 }

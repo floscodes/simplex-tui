@@ -285,6 +285,12 @@ fn command_loop(
             .recv(Duration::from_millis(200))
             .map_err(|e| e.to_string())?
         {
+            if let Some((user_id, chat_ref)) = chat::connected_contact(&value) {
+                let chats = load_chats(&controller, user_id)?;
+                sender
+                    .send(SimplexEvent::ContactConnected { chats, chat_ref })
+                    .map_err(|e| e.to_string())?;
+            }
             for (chat_ref, message) in chat::new_messages(&value) {
                 sender
                     .send(SimplexEvent::MessageReceived { chat_ref, message })

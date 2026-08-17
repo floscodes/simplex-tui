@@ -64,6 +64,10 @@ pub enum SimplexEvent {
         messages: Vec<Message>,
     },
     ChatMarkedRead(ChatRef),
+    ContactConnected {
+        chats: Vec<ChatSummary>,
+        chat_ref: ChatRef,
+    },
     MessageReceived {
         chat_ref: ChatRef,
         message: Message,
@@ -146,6 +150,16 @@ pub fn profile_and_features(value: &Value) -> Result<(Value, ChatFeatures), Stri
         files_and_media: enabled("files", true),
     };
     Ok((profile, features))
+}
+
+pub fn connected_contact(value: &Value) -> Option<(i64, ChatRef)> {
+    let result = value.get("result")?;
+    if result.get("type")?.as_str()? != "contactConnected" {
+        return None;
+    }
+    let user_id = result.pointer("/user/userId")?.as_i64()?;
+    let contact_id = result.pointer("/contact/contactId")?.as_i64()?;
+    Some((user_id, ChatRef(format!("@{contact_id}"))))
 }
 
 fn collect_smp_servers(value: &Value, servers: &mut Vec<String>) {
@@ -512,6 +526,20 @@ mod tests {
         assert_eq!(
             servers,
             vec!["smp://fingerprint@smp11.simplex.im,onion".to_owned()]
+        );
+    }
+
+    #[test]
+    fn recognizes_a_connected_invitation_contact() {
+        let connected = connected_contact(&json!({"result": {
+            "type": "contactConnected",
+            "user": {"userId": 4},
+            "contact": {"contactId": 19, "localDisplayName": "bob"}
+        }}));
+        assert_eq!(connected, Some((4, ChatRef("@19".into()))));
+        assert_eq!(
+            connected_contact(&json!({"result": {"type": "cmdOk"}})),
+            None
         );
     }
 }
