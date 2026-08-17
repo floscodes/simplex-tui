@@ -596,6 +596,13 @@ impl App {
                     self.notice = Some("Contact connected".into());
                 }
                 SimplexEvent::MessageReceived { chat_ref, message } => {
+                    let is_new = !self
+                        .message_cache
+                        .get(&chat_ref)
+                        .is_some_and(|messages| messages.iter().any(|item| item.id == message.id));
+                    if !is_new {
+                        continue;
+                    }
                     let chat_is_visible = self.section == Section::Chats
                         && self.selected_chat_ref() == Some(&chat_ref)
                         && self.loaded_chat.as_ref() == Some(&chat_ref)
@@ -603,18 +610,25 @@ impl App {
                     if chat_is_visible {
                         if !self.messages.iter().any(|item| item.id == message.id) {
                             self.messages.push(message.clone());
-                            cache_message(&mut self.message_cache, &chat_ref, message);
-                            self.chat_scroll = self.chat_scroll.saturating_add(1);
-                            self.new_messages_below = self.new_messages_below.saturating_add(1);
-                            if let Some(chat) =
-                                self.chats.iter_mut().find(|chat| chat.chat_ref == chat_ref)
-                            {
-                                chat.unread_count = chat.unread_count.saturating_add(1);
+                            cache_message(&mut self.message_cache, &chat_ref, message.clone());
+                            if !message.outgoing {
+                                self.chat_scroll = self.chat_scroll.saturating_add(1);
+                                self.new_messages_below = self.new_messages_below.saturating_add(1);
+                                if let Some(chat) =
+                                    self.chats.iter_mut().find(|chat| chat.chat_ref == chat_ref)
+                                {
+                                    chat.unread_count = chat.unread_count.saturating_add(1);
+                                }
+                            } else if self.chat_scroll > 0 {
+                                // Preserve the viewport when sending while reading older messages,
+                                // without presenting the sent item as a new/unread message.
+                                self.chat_scroll = self.chat_scroll.saturating_add(1);
                             }
                         }
                     } else {
-                        if let Some(chat) =
-                            self.chats.iter_mut().find(|chat| chat.chat_ref == chat_ref)
+                        if !message.outgoing
+                            && let Some(chat) =
+                                self.chats.iter_mut().find(|chat| chat.chat_ref == chat_ref)
                         {
                             chat.unread_count += 1;
                         }
@@ -1038,6 +1052,71 @@ mod tests {
             .unwrap();
         app.tick();
         assert_eq!(app.messages[0].text, "hello");
+    }
+
+    #[tokio::test]
+    async fn outgoing_message_is_shown_without_becoming_unread() {
+        let (event_sender, event_receiver) = mpsc::channel();
+        let chat_ref = ChatRef("@7".into());
+        let mut app = App {
+            section: Section::Chats,
+            chats: vec![ChatSummary {
+                chat_ref: chat_ref.clone(),
+                display_name: "alice".into(),
+                unread_count: 0,
+            }],
+            loaded_chat: Some(chat_ref.clone()),
+            simplex_events: event_receiver,
+            ..App::default()
+        };
+        event_sender
+            .send(SimplexEvent::MessageReceived {
+                chat_ref,
+                message: Message {
+                    id: 1,
+                    text: "sent from the TUI".into(),
+                    timestamp: String::new(),
+                    outgoing: true,
+                },
+            })
+            .unwrap();
+
+        app.tick();
+
+        assert_eq!(app.messages.len(), 1);
+        assert_eq!(app.chats[0].unread_count, 0);
+        assert_eq!(app.new_messages_below, 0);
+        assert_eq!(app.chat_scroll, 0);
+    }
+
+    #[tokio::test]
+    async fn outgoing_background_message_does_not_increment_unread_count() {
+        let (event_sender, event_receiver) = mpsc::channel();
+        let mut app = App {
+            section: Section::Settings,
+            chats: vec![ChatSummary {
+                chat_ref: ChatRef("@7".into()),
+                display_name: "alice".into(),
+                unread_count: 0,
+            }],
+            simplex_events: event_receiver,
+            ..App::default()
+        };
+        event_sender
+            .send(SimplexEvent::MessageReceived {
+                chat_ref: ChatRef("@7".into()),
+                message: Message {
+                    id: 2,
+                    text: "sent elsewhere".into(),
+                    timestamp: String::new(),
+                    outgoing: true,
+                },
+            })
+            .unwrap();
+
+        app.tick();
+
+        assert_eq!(app.chats[0].unread_count, 0);
     }
 
     #[tokio::test]

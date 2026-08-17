@@ -286,57 +286,25 @@ fn render_chat(app: &App, area: Rect, buf: &mut Buffer) {
         .fg(Color::DarkGray)
         .render(rows[0], buf);
     let available = usize::from(rows[1].height);
-    let message_lines: Vec<Vec<Line>> = app
+    let bubble_specs: Vec<(u16, u16)> = app
         .messages
         .iter()
         .map(|message| {
             let time = message.timestamp.get(11..16).unwrap_or("");
             let prefix = if message.outgoing { "You" } else { chat };
-            let color = if message.outgoing {
-                Color::Rgb(40, 210, 130)
-            } else {
-                Color::Rgb(70, 160, 255)
-            };
-            let label = format!("{time} {prefix}: ");
-            let mut text_lines = message.text.split('\n');
-            let first = text_lines.next().unwrap_or_default().trim_end_matches('\r');
-            let mut rendered = vec![Line::from(vec![
-                Span::styled(
-                    label.clone(),
-                    Style::default().fg(color).add_modifier(Modifier::BOLD),
-                ),
-                Span::raw(first.to_owned()),
-            ])];
-            rendered.extend(text_lines.map(|line| {
-                Line::from(vec![
-                    Span::raw(" ".repeat(label.chars().count())),
-                    Span::raw(line.trim_end_matches('\r').to_owned()),
-                ])
-            }));
-            if !app.preferences.compact_messages {
-                rendered.push(Line::default());
-            }
-            rendered
+            bubble_size(&message.text, prefix, time, rows[1].width)
         })
         .collect();
-    let text_width = usize::from(rows[1].width.saturating_sub(1).max(1));
-    let message_heights: Vec<usize> = message_lines
-        .iter()
-        .map(|lines| {
-            lines
-                .iter()
-                .map(|line| line.width().max(1).div_ceil(text_width))
-                .sum()
-        })
-        .collect();
+    let gap = usize::from(!app.preferences.compact_messages);
     let mut top_page_messages: usize = 0;
     let mut top_page_height: usize = 0;
-    for &height in &message_heights {
-        if top_page_messages > 0 && top_page_height.saturating_add(height) > available {
+    for &(height, _) in &bubble_specs {
+        let required = usize::from(height) + usize::from(top_page_messages > 0) * gap;
+        if top_page_messages > 0 && top_page_height.saturating_add(required) > available {
             break;
         }
         top_page_messages += 1;
-        top_page_height = top_page_height.saturating_add(height);
+        top_page_height = top_page_height.saturating_add(required);
         if top_page_height >= available {
             break;
         }
@@ -345,27 +313,56 @@ fn render_chat(app: &App, area: Rect, buf: &mut Buffer) {
     app.max_chat_scroll.set(max_scroll);
     let effective_scroll = app.chat_scroll.min(max_scroll);
     let visible_end = app.messages.len().saturating_sub(effective_scroll);
-    let all_lines: Vec<Line> = message_lines[..visible_end]
-        .iter()
-        .flatten()
-        .cloned()
-        .collect();
-    let line_start = all_lines.len().saturating_sub(available);
-    let lines = all_lines[line_start..].to_vec();
-    let content = if let Some(error) = &app.chat_error {
-        Paragraph::new(error.as_str()).fg(Color::Red)
+    let mut visible_start = visible_end;
+    let mut visible_height = 0usize;
+    while visible_start > 0 {
+        let height = usize::from(bubble_specs[visible_start - 1].0);
+        let required = height + usize::from(visible_start < visible_end) * gap;
+        if visible_start < visible_end && visible_height.saturating_add(required) > available {
+            break;
+        }
+        visible_start -= 1;
+        visible_height = visible_height.saturating_add(required);
+        if visible_height >= available {
+            break;
+        }
+    }
+    if let Some(error) = &app.chat_error {
+        Paragraph::new(error.as_str())
+            .fg(Color::Red)
+            .render(rows[1], buf);
     } else if app.chat_loading || app.loaded_chat.as_ref() != Some(&summary.chat_ref) {
-        Paragraph::new("Loading messages…").fg(Color::DarkGray)
-    } else if lines.is_empty() {
-        Paragraph::new("No messages in this conversation.").fg(Color::DarkGray)
+        Paragraph::new("Loading messages…")
+            .fg(Color::DarkGray)
+            .render(rows[1], buf);
+    } else if visible_start == visible_end {
+        Paragraph::new("No messages in this conversation.")
+            .fg(Color::DarkGray)
+            .render(rows[1], buf);
     } else {
-        Paragraph::new(lines)
-    };
-    content.wrap(Wrap { trim: false }).render(rows[1], buf);
+        render_message_bubbles(
+            app,
+            chat,
+            rows[1],
+            buf,
+            &bubble_specs,
+            visible_start,
+            visible_end,
+            gap,
+            visible_height,
+        );
+    }
 
-    let total_height = message_heights.iter().sum::<usize>();
-    let height_before_end = message_heights[..visible_end].iter().sum::<usize>();
-    let top_line = height_before_end.saturating_sub(available);
+    let total_height = bubble_specs
+        .iter()
+        .map(|(height, _)| usize::from(*height))
+        .sum::<usize>()
+        + bubble_specs.len().saturating_sub(1) * gap;
+    let top_line = bubble_specs[..visible_start]
+        .iter()
+        .map(|(height, _)| usize::from(*height))
+        .sum::<usize>()
+        + visible_start.saturating_sub(1) * gap;
     render_chat_scrollbar(rows[1], buf, total_height, available, top_line);
 
     if app.chat_scroll > 0 && rows[1].width > 4 && rows[1].height > 0 {
@@ -436,6 +433,87 @@ fn render_chat(app: &App, area: Rect, buf: &mut Buffer) {
             .alignment(Alignment::Center)
             .fg(Color::DarkGray)
             .render(*footer, buf);
+    }
+}
+
+fn bubble_size(text: &str, sender: &str, time: &str, area_width: u16) -> (u16, u16) {
+    let available_width = area_width.saturating_sub(1).max(1);
+    let max_width = available_width.saturating_mul(3).div_ceil(4).max(1);
+    let title_width = sender.chars().count() + time.chars().count() + 5;
+    let longest_line = text
+        .lines()
+        .map(|line| line.chars().count())
+        .max()
+        .unwrap_or(1);
+    let desired = u16::try_from(longest_line.max(title_width).saturating_add(4))
+        .unwrap_or(max_width)
+        .clamp(12.min(available_width), max_width.min(available_width));
+    let content_width = usize::from(desired.saturating_sub(4).max(1));
+    let content_height = text
+        .split('\n')
+        .map(|line| line.chars().count().max(1).div_ceil(content_width))
+        .sum::<usize>()
+        .max(1);
+    let height = u16::try_from(content_height.saturating_add(2)).unwrap_or(u16::MAX);
+    (height, desired)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_message_bubbles(
+    app: &App,
+    peer: &str,
+    area: Rect,
+    buf: &mut Buffer,
+    bubble_specs: &[(u16, u16)],
+    visible_start: usize,
+    visible_end: usize,
+    gap: usize,
+    visible_height: usize,
+) {
+    let mut y = area.bottom().saturating_sub(
+        u16::try_from(visible_height)
+            .unwrap_or(area.height)
+            .min(area.height),
+    );
+    for (index, &(height, width)) in bubble_specs
+        .iter()
+        .enumerate()
+        .take(visible_end)
+        .skip(visible_start)
+    {
+        let message = &app.messages[index];
+        let height = height.min(area.bottom().saturating_sub(y));
+        if height == 0 {
+            continue;
+        }
+        let x = if message.outgoing {
+            area.right().saturating_sub(1).saturating_sub(width)
+        } else {
+            area.x
+        };
+        let bubble_area = Rect::new(x, y, width, height);
+        let time = message.timestamp.get(11..16).unwrap_or("");
+        let sender = if message.outgoing { "You" } else { peer };
+        let color = if message.outgoing {
+            Color::Rgb(40, 210, 130)
+        } else {
+            Color::Rgb(70, 160, 255)
+        };
+        let bubble = Block::bordered()
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(Color::DarkGray))
+            .padding(Padding::horizontal(1))
+            .title(Line::from(Span::styled(
+                format!(" {sender} · {time} "),
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
+            )));
+        Paragraph::new(message.text.as_str())
+            .block(bubble)
+            .wrap(Wrap { trim: false })
+            .render(bubble_area, buf);
+        y = y
+            .saturating_add(height)
+            .saturating_add(u16::try_from(gap).unwrap_or(0));
     }
 }
 
