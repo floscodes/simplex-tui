@@ -22,6 +22,7 @@ pub enum SimplexCommand {
     },
     ActivateProfile(i64),
     CreateProfile(String),
+    DeleteProfile(i64),
     SetNotifications {
         user_id: i64,
         enabled: bool,
@@ -47,6 +48,12 @@ pub enum ChatFeature {
     Reactions,
     VoiceMessages,
     FilesAndMedia,
+}
+
+struct DeletedProfileState {
+    profiles: Vec<chat::Profile>,
+    active_user: Option<chat::User>,
+    chats: Vec<chat::ChatSummary>,
 }
 
 pub fn spawn(api: Arc<SimplexApi>, sender: Sender<SimplexEvent>) -> Sender<SimplexCommand> {
@@ -224,6 +231,19 @@ fn command_loop(
                         .send(result.unwrap_or_else(SimplexEvent::Failed))
                         .map_err(|e| e.to_string())?;
                 }
+                SimplexCommand::DeleteProfile(user_id) => {
+                    let result = delete_profile(&controller, user_id);
+                    sender
+                        .send(match result {
+                            Ok(state) => SimplexEvent::ProfileDeleted {
+                                profiles: state.profiles,
+                                active_user: state.active_user,
+                                chats: state.chats,
+                            },
+                            Err(error) => SimplexEvent::ProfileDeleteFailed(error),
+                        })
+                        .map_err(|e| e.to_string())?;
+                }
                 SimplexCommand::SetNotifications { user_id, enabled } => {
                     let action = if enabled { "unmute" } else { "mute" };
                     let response = controller
@@ -298,6 +318,39 @@ fn command_loop(
             }
         }
     }
+}
+
+fn delete_profile(
+    controller: &crate::simplex::SimplexController,
+    user_id: i64,
+) -> Result<DeletedProfileState, String> {
+    let profiles = load_profiles(controller)?;
+    if profiles
+        .iter()
+        .any(|profile| profile.id == user_id && profile.active)
+        && let Some(other) = profiles.iter().find(|profile| profile.id != user_id)
+    {
+        let response = controller
+            .command(&format!("/_user {}", other.id))
+            .map_err(|e| e.to_string())?;
+        chat::active_user(&response)?.ok_or("SimpleX did not activate the replacement profile")?;
+    }
+    let response = controller
+        .command(&format!("/_delete user {user_id} del_smp=on"))
+        .map_err(|e| e.to_string())?;
+    ensure_ok(&response, "profile deletion")?;
+    let profiles = load_profiles(controller)?;
+    let active_user = chat::active_user(&controller.command("/u").map_err(|e| e.to_string())?)?;
+    let chats = if let Some(user) = &active_user {
+        load_chats(controller, user.id)?
+    } else {
+        Vec::new()
+    };
+    Ok(DeletedProfileState {
+        profiles,
+        active_user,
+        chats,
+    })
 }
 
 fn mark_chat_read(

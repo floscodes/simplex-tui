@@ -4,7 +4,9 @@ use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style, Stylize},
     text::{Line, Span},
-    widgets::{Block, BorderType, Borders, List, ListItem, Padding, Paragraph, Tabs, Widget, Wrap},
+    widgets::{
+        Block, BorderType, Borders, Clear, List, ListItem, Padding, Paragraph, Tabs, Widget, Wrap,
+    },
 };
 use tui_qrcode::{Colors, QrCodeWidget, Scaling};
 
@@ -32,6 +34,8 @@ impl Widget for &App {
         self.composer_area.set(Rect::default());
         self.send_area.set(Rect::default());
         self.jump_to_latest_area.set(Rect::default());
+        self.delete_cancel_area.set(Rect::default());
+        self.delete_ok_area.set(Rect::default());
         let columns = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Percentage(32), Constraint::Percentage(68)])
@@ -44,6 +48,9 @@ impl Widget for &App {
         render_tabs(self, sidebar[0], buf);
         render_sidebar(self, sidebar[1], buf);
         render_detail(self, columns[1], buf);
+        if self.input_mode == InputMode::ConfirmDeleteProfile {
+            render_delete_profile_confirmation(self, area, buf);
+        }
     }
 }
 
@@ -173,7 +180,7 @@ fn render_profile(app: &App, area: Rect, buf: &mut Buffer) {
     }
     let profile = &app.profiles[app.selected_profile];
     Paragraph::new(format!(
-        "Display name\n{}\n\nNotifications\n{}\n\nStatus\n{}\n\nEnter: activate · n: new profile",
+        "Display name\n{}\n\nNotifications\n{}\n\nStatus\n{}\n\nEnter: activate · n: new profile · d: delete",
         profile.display_name,
         enabled(profile.notifications),
         if profile.active { "Active" } else { "Inactive" },
@@ -181,6 +188,55 @@ fn render_profile(app: &App, area: Rect, buf: &mut Buffer) {
     .block(panel(&profile.display_name).padding(Padding::new(2, 2, 1, 1)))
     .wrap(Wrap { trim: false })
     .render(area, buf);
+}
+
+fn render_delete_profile_confirmation(app: &App, area: Rect, buf: &mut Buffer) {
+    let Some(profile) = app.profiles.get(app.selected_profile) else {
+        return;
+    };
+    let width = area.width.min(68);
+    let height = area.height.min(9);
+    let popup = Rect::new(
+        area.x + area.width.saturating_sub(width) / 2,
+        area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    );
+    Clear.render(popup, buf);
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(Color::Red))
+        .title(" Delete profile ");
+    let inner = block.inner(popup);
+    block.render(popup, buf);
+    let rows = Layout::vertical([Constraint::Min(2), Constraint::Length(3)]).split(inner);
+    Paragraph::new(format!(
+        "Are you sure that you want to delete profile {}?",
+        profile.display_name
+    ))
+    .alignment(Alignment::Center)
+    .wrap(Wrap { trim: false })
+    .render(rows[0], buf);
+    let buttons =
+        Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).split(rows[1]);
+    app.delete_cancel_area.set(buttons[0]);
+    app.delete_ok_area.set(buttons[1]);
+    Paragraph::new("Cancel (Enter)")
+        .alignment(Alignment::Center)
+        .block(
+            Block::bordered()
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(Color::Cyan)),
+        )
+        .render(buttons[0], buf);
+    Paragraph::new("OK (y)")
+        .alignment(Alignment::Center)
+        .block(
+            Block::bordered()
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(Color::Red)),
+        )
+        .render(buttons[1], buf);
 }
 
 fn render_chat(app: &App, area: Rect, buf: &mut Buffer) {

@@ -32,6 +32,7 @@ pub enum InputMode {
     #[default]
     None,
     CreateProfile,
+    ConfirmDeleteProfile,
 }
 
 /// All state owned by the user interface.
@@ -70,6 +71,8 @@ pub struct App {
     pub(crate) send_area: Cell<Rect>,
     pub(crate) jump_to_latest_area: Cell<Rect>,
     pub(crate) max_chat_scroll: Cell<usize>,
+    pub(crate) delete_cancel_area: Cell<Rect>,
+    pub(crate) delete_ok_area: Cell<Rect>,
     pub events: EventHandler,
     message_cache: HashMap<ChatRef, Vec<Message>>,
     simplex_events: mpsc::Receiver<SimplexEvent>,
@@ -113,6 +116,8 @@ impl Default for App {
             send_area: Cell::new(Rect::default()),
             jump_to_latest_area: Cell::new(Rect::default()),
             max_chat_scroll: Cell::new(0),
+            delete_cancel_area: Cell::new(Rect::default()),
+            delete_ok_area: Cell::new(Rect::default()),
             events: EventHandler::new(),
             message_cache: HashMap::new(),
             simplex_events,
@@ -168,6 +173,14 @@ impl App {
     pub fn handle_key_events(&mut self, key: KeyEvent) -> color_eyre::Result<()> {
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
             self.events.send(AppEvent::Quit);
+            return Ok(());
+        }
+        if self.input_mode == InputMode::ConfirmDeleteProfile {
+            match key.code {
+                KeyCode::Char('y') => self.confirm_delete_profile(),
+                KeyCode::Enter | KeyCode::Esc => self.input_mode = InputMode::None,
+                _ => {}
+            }
             return Ok(());
         }
         if self.input_mode == InputMode::CreateProfile {
@@ -245,6 +258,12 @@ impl App {
                 self.input_mode = InputMode::CreateProfile;
                 self.input.clear();
             }
+            KeyCode::Char('d')
+                if self.section == Section::Profiles
+                    && self.selected_profile < self.profiles.len() =>
+            {
+                self.input_mode = InputMode::ConfirmDeleteProfile;
+            }
             KeyCode::Enter | KeyCode::Char(' ') if self.section == Section::Settings => {
                 self.activate_setting()
             }
@@ -314,6 +333,16 @@ impl App {
     }
 
     fn handle_mouse_event(&mut self, kind: MouseEventKind, column: u16, row: u16) {
+        if self.input_mode == InputMode::ConfirmDeleteProfile
+            && matches!(kind, MouseEventKind::Down(MouseButton::Left))
+        {
+            if self.delete_ok_area.get().contains((column, row).into()) {
+                self.confirm_delete_profile();
+            } else if self.delete_cancel_area.get().contains((column, row).into()) {
+                self.input_mode = InputMode::None;
+            }
+            return;
+        }
         if matches!(kind, MouseEventKind::Down(MouseButton::Left)) {
             if self
                 .jump_to_latest_area
@@ -481,6 +510,26 @@ impl App {
                     self.invitation_error = None;
                     self.notice = Some("Profile created".into());
                     self.sync_selected_profile();
+                }
+                SimplexEvent::ProfileDeleted {
+                    profiles,
+                    active_user,
+                    chats,
+                } => {
+                    self.profiles = profiles;
+                    self.chats = chats;
+                    self.messages.clear();
+                    self.message_cache.clear();
+                    self.loaded_chat = None;
+                    self.selected_chat = 0;
+                    self.startup = active_user
+                        .map(StartupState::Ready)
+                        .unwrap_or(StartupState::NoActiveUser);
+                    self.notice = Some("Profile deleted".into());
+                    self.sync_selected_profile();
+                }
+                SimplexEvent::ProfileDeleteFailed(error) => {
+                    self.notice = Some(format!("Could not delete profile: {error}"));
                 }
                 SimplexEvent::SettingChanged(message) => self.notice = Some(message),
                 SimplexEvent::AutoDeleteLoaded(seconds) => self.auto_delete_seconds = seconds,
@@ -732,6 +781,19 @@ impl App {
         let _ = self
             .simplex_commands
             .send(SimplexCommand::ActivateProfile(profile.id));
+    }
+
+    fn confirm_delete_profile(&mut self) {
+        let Some(profile) = self.profiles.get(self.selected_profile) else {
+            self.input_mode = InputMode::None;
+            return;
+        };
+        let user_id = profile.id;
+        self.input_mode = InputMode::None;
+        self.notice = Some(format!("Deleting profile {}…", profile.display_name));
+        let _ = self
+            .simplex_commands
+            .send(SimplexCommand::DeleteProfile(user_id));
     }
 
     fn activate_setting(&mut self) {
@@ -1058,5 +1120,38 @@ mod tests {
             .unwrap();
         app.tick();
         assert_eq!(app.messages[0].text, "from background");
+    }
+
+    #[tokio::test]
+    async fn profile_delete_requires_explicit_confirmation() {
+        let (commands, receiver) = mpsc::channel();
+        let mut app = App {
+            section: Section::Profiles,
+            profiles: vec![Profile {
+                id: 9,
+                display_name: "work".into(),
+                notifications: true,
+                active: true,
+            }],
+            simplex_commands: commands,
+            ..App::default()
+        };
+
+        app.handle_key_events(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(app.input_mode, InputMode::ConfirmDeleteProfile);
+        app.handle_key_events(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(app.input_mode, InputMode::None);
+        assert!(receiver.try_recv().is_err());
+
+        app.handle_key_events(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE))
+            .unwrap();
+        app.handle_key_events(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))
+            .unwrap();
+        let SimplexCommand::DeleteProfile(user_id) = receiver.try_recv().unwrap() else {
+            panic!("expected delete-profile command")
+        };
+        assert_eq!(user_id, 9);
     }
 }

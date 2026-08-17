@@ -53,6 +53,12 @@ pub enum SimplexEvent {
         profiles: Vec<Profile>,
         chats: Vec<ChatSummary>,
     },
+    ProfileDeleted {
+        profiles: Vec<Profile>,
+        active_user: Option<User>,
+        chats: Vec<ChatSummary>,
+    },
+    ProfileDeleteFailed(String),
     SettingChanged(String),
     AutoDeleteLoaded(i64),
     ServersLoaded(Vec<String>),
