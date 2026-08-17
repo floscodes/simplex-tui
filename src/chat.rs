@@ -28,6 +28,15 @@ pub struct Message {
     pub outgoing: bool,
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ChatFeatures {
+    pub disappearing_messages: bool,
+    pub full_deletion: bool,
+    pub reactions: bool,
+    pub voice_messages: bool,
+    pub files_and_media: bool,
+}
+
 #[derive(Clone, Debug)]
 pub enum SimplexEvent {
     Ready {
@@ -46,10 +55,15 @@ pub enum SimplexEvent {
     },
     SettingChanged(String),
     AutoDeleteLoaded(i64),
+    ServersLoaded(Vec<String>),
+    ChatFeaturesLoaded(ChatFeatures),
+    InvitationCreated(String),
+    InvitationFailed(String),
     ChatLoaded {
         chat_ref: ChatRef,
         messages: Vec<Message>,
     },
+    ChatMarkedRead(ChatRef),
     MessageReceived {
         chat_ref: ChatRef,
         message: Message,
@@ -68,6 +82,87 @@ pub enum SimplexEvent {
     },
     NoActiveUser,
     Failed(String),
+}
+
+pub fn invitation_link(value: &Value) -> Result<String, String> {
+    let result = value
+        .get("result")
+        .ok_or_else(|| response_error(value, "invitation"))?;
+    if result.get("type").and_then(Value::as_str) != Some("invitation") {
+        return Err(response_error(value, "invitation"));
+    }
+    let link = result
+        .pointer("/connLinkInvitation/connShortLink")
+        .and_then(Value::as_str)
+        .filter(|link| !link.is_empty())
+        .or_else(|| {
+            result
+                .pointer("/connLinkInvitation/connFullLink")
+                .and_then(Value::as_str)
+        })
+        .ok_or("invitation response has no connection link")?;
+    Ok(link.to_owned())
+}
+
+pub fn smp_servers(value: &Value) -> Result<Vec<String>, String> {
+    let result = value
+        .get("result")
+        .ok_or_else(|| response_error(value, "SMP servers"))?;
+    if result.get("type").and_then(Value::as_str) != Some("userServers") {
+        return Err(response_error(value, "SMP servers"));
+    }
+    let mut servers = Vec::new();
+    collect_smp_servers(result, &mut servers);
+    servers.sort();
+    servers.dedup();
+    Ok(servers)
+}
+
+pub fn profile_and_features(value: &Value) -> Result<(Value, ChatFeatures), String> {
+    let result = value
+        .get("result")
+        .ok_or_else(|| response_error(value, "user profile"))?;
+    if result.get("type").and_then(Value::as_str) != Some("userProfile") {
+        return Err(response_error(value, "user profile"));
+    }
+    let profile = result
+        .get("profile")
+        .cloned()
+        .ok_or("userProfile response has no profile")?;
+    let preferences = profile.get("preferences");
+    let enabled = |name: &str, default: bool| {
+        preferences
+            .and_then(|prefs| prefs.get(name))
+            .and_then(|pref| pref.get("allow"))
+            .and_then(Value::as_str)
+            .map(|allow| allow != "no")
+            .unwrap_or(default)
+    };
+    let features = ChatFeatures {
+        disappearing_messages: enabled("timedMessages", false),
+        full_deletion: enabled("fullDelete", false),
+        reactions: enabled("reactions", true),
+        voice_messages: enabled("voice", true),
+        files_and_media: enabled("files", true),
+    };
+    Ok((profile, features))
+}
+
+fn collect_smp_servers(value: &Value, servers: &mut Vec<String>) {
+    match value {
+        Value::String(server) if server.starts_with("smp://") => servers.push(server.clone()),
+        Value::Array(values) => {
+            for value in values {
+                collect_smp_servers(value, servers);
+            }
+        }
+        Value::Object(values) => {
+            for value in values.values() {
+                collect_smp_servers(value, servers);
+            }
+        }
+        _ => {}
+    }
 }
 
 pub fn active_user(value: &Value) -> Result<Option<User>, String> {
@@ -258,6 +353,12 @@ fn chat_ref(info: &Value) -> Result<ChatRef, String> {
 }
 
 fn parse_message(item: &Value) -> Option<Message> {
+    if !matches!(
+        item.pointer("/content/type").and_then(Value::as_str),
+        Some("sndMsgContent" | "rcvMsgContent")
+    ) {
+        return None;
+    }
     let meta = item.get("meta")?;
     let text = meta.get("itemText")?.as_str()?.to_owned();
     if text.is_empty() {
@@ -340,7 +441,8 @@ mod tests {
     fn parses_chat_history_and_live_item() {
         let info =
             json!({"type": "direct", "contact": {"contactId": 9, "localDisplayName": "bob"}});
-        let item = json!({"chatDir": {"type": "directSnd"}, "meta": {
+        let item = json!({"chatDir": {"type": "directSnd"},
+            "content": {"type": "sndMsgContent", "msgContent": {"type": "text", "text": "hello"}}, "meta": {
             "itemId": 12, "itemText": "hello", "itemTs": "2026-08-16T10:00:00Z"
         }});
         let (chat_ref, messages) = chat_messages(&json!({"result": {"type": "apiChat", "chat": {
@@ -350,5 +452,66 @@ mod tests {
         assert_eq!(chat_ref, ChatRef("@9".into()));
         assert!(messages[0].outgoing);
         assert_eq!(messages[0].text, "hello");
+    }
+
+    #[test]
+    fn protocol_feature_items_are_not_user_messages() {
+        let item = json!({
+            "chatDir": {"type": "directSnd"},
+            "content": {"type": "sndChatFeature", "feature": "calls"},
+            "meta": {"itemId": 13, "itemText": "Audio/video calls: off"}
+        });
+        assert_eq!(parse_message(&item), None);
+    }
+
+    #[test]
+    fn parses_profile_chat_features() {
+        let (_, features) = profile_and_features(&json!({"result": {
+            "type": "userProfile", "profile": {
+                "displayName": "alice", "fullName": "", "preferences": {
+                    "timedMessages": {"allow": "no"},
+                    "fullDelete": {"allow": "yes"},
+                    "reactions": {"allow": "yes"},
+                    "voice": {"allow": "no"},
+                    "files": {"allow": "yes"},
+                    "calls": {"allow": "no"}
+                }
+            }
+        }}))
+        .unwrap();
+        assert!(!features.disappearing_messages);
+        assert!(features.full_deletion);
+        assert!(features.reactions);
+        assert!(!features.voice_messages);
+        assert!(features.files_and_media);
+    }
+
+    #[test]
+    fn prefers_the_short_invitation_link() {
+        let link = invitation_link(&json!({"result": {
+            "type": "invitation",
+            "connLinkInvitation": {
+                "connFullLink": "simplex:/contact#full",
+                "connShortLink": "https://simplex.chat/contact#short"
+            }
+        }}))
+        .unwrap();
+        assert_eq!(link, "https://simplex.chat/contact#short");
+    }
+
+    #[test]
+    fn extracts_and_deduplicates_profile_smp_servers() {
+        let servers = smp_servers(&json!({"result": {
+            "type": "userServers",
+            "userServers": [{"smpServers": [
+                {"server": "smp://fingerprint@smp11.simplex.im,onion"},
+                {"server": "smp://fingerprint@smp11.simplex.im,onion"}
+            ]}]
+        }}))
+        .unwrap();
+        assert_eq!(
+            servers,
+            vec!["smp://fingerprint@smp11.simplex.im,onion".to_owned()]
+        );
     }
 }

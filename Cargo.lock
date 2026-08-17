@@ -1139,6 +1139,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "qrcode"
+version = "0.14.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d68782463e408eb1e668cf6152704bd856c78c5b6417adaee3203d8f4c1fc9ec"
+
+[[package]]
 name = "quote"
 version = "1.0.47"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1480,12 +1486,14 @@ dependencies = [
  "futures",
  "libc",
  "libloading",
+ "qrcode",
  "ratatui",
  "serde",
  "serde_json",
  "tempfile",
  "thiserror 2.0.20",
  "tokio",
+ "tui-qrcode",
 ]
 
 [[package]]
@@ -1808,6 +1816,17 @@ dependencies = [
  "sharded-slab",
  "thread_local",
  "tracing-core",
+]
+
+[[package]]
+name = "tui-qrcode"
+version = "0.2.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ffa20e8f11f558313e664b2f4aff0f6c7297a141bb2b721229bcf1fd0016ffff"
+dependencies = [
+ "color-eyre",
+ "qrcode",
+ "ratatui-core",
 ]
 
 [[package]]

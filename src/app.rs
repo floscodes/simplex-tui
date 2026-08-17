@@ -3,10 +3,10 @@ use std::{cell::Cell, sync::mpsc};
 
 use crate::event::{AppEvent, Event, EventHandler};
 use crate::{
-    chat::{ChatRef, ChatSummary, Message, Profile, SimplexEvent, User},
+    chat::{ChatFeatures, ChatRef, ChatSummary, Message, Profile, SimplexEvent, User},
     preferences::Preferences,
     simplex::SimplexApi,
-    simplex_worker::SimplexCommand,
+    simplex_worker::{ChatFeature, SimplexCommand},
 };
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind};
 use ratatui::{DefaultTerminal, layout::Rect};
@@ -49,11 +49,18 @@ pub struct App {
     pub loaded_chat: Option<ChatRef>,
     pub chat_loading: bool,
     pub chat_error: Option<String>,
+    pub chat_scroll: usize,
+    pub new_messages_below: usize,
     pub composer: String,
     pub composer_focused: bool,
     pub sending: bool,
     pub preferences: Preferences,
     pub auto_delete_seconds: i64,
+    pub smp_servers: Vec<String>,
+    pub chat_features: ChatFeatures,
+    pub invitation_link: Option<String>,
+    pub invitation_loading: bool,
+    pub invitation_error: Option<String>,
     pub input_mode: InputMode,
     pub input: String,
     pub notice: Option<String>,
@@ -61,6 +68,8 @@ pub struct App {
     pub(crate) area: Cell<Rect>,
     pub(crate) composer_area: Cell<Rect>,
     pub(crate) send_area: Cell<Rect>,
+    pub(crate) jump_to_latest_area: Cell<Rect>,
+    pub(crate) max_chat_scroll: Cell<usize>,
     pub events: EventHandler,
     simplex_events: mpsc::Receiver<SimplexEvent>,
     simplex_commands: mpsc::Sender<SimplexCommand>,
@@ -83,17 +92,26 @@ impl Default for App {
             loaded_chat: None,
             chat_loading: false,
             chat_error: None,
+            chat_scroll: 0,
+            new_messages_below: 0,
             composer: String::new(),
             composer_focused: false,
             sending: false,
             preferences: Preferences::default(),
             auto_delete_seconds: 0,
+            smp_servers: Vec::new(),
+            chat_features: ChatFeatures::default(),
+            invitation_link: None,
+            invitation_loading: false,
+            invitation_error: None,
             input_mode: InputMode::None,
             input: String::new(),
             notice: None,
             area: Cell::new(Rect::default()),
             composer_area: Cell::new(Rect::default()),
             send_area: Cell::new(Rect::default()),
+            jump_to_latest_area: Cell::new(Rect::default()),
+            max_chat_scroll: Cell::new(0),
             events: EventHandler::new(),
             simplex_events,
             simplex_commands,
@@ -102,11 +120,13 @@ impl Default for App {
 }
 
 impl App {
-    pub const SETTINGS: [&'static str; 5] = [
+    pub const SETTINGS: [&'static str; 7] = [
         "General",
         "Notifications",
         "Privacy & Security",
         "Appearance",
+        "Chat Features",
+        "SMP Servers",
         "About",
     ];
 
@@ -199,8 +219,21 @@ impl App {
         }
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') => self.events.send(AppEvent::Quit),
+            KeyCode::Char('n') if self.section == Section::Chats => self.show_invitation(),
+            KeyCode::Char('r')
+                if self.section == Section::Chats && self.selected_chat == self.chats.len() =>
+            {
+                self.create_invitation()
+            }
+            KeyCode::Enter
+                if self.section == Section::Chats && self.selected_chat == self.chats.len() =>
+            {
+                if self.invitation_link.is_none() {
+                    self.create_invitation();
+                }
+            }
             KeyCode::Enter | KeyCode::Char('i')
-                if self.section == Section::Chats && !self.chats.is_empty() =>
+                if self.section == Section::Chats && self.selected_chat < self.chats.len() =>
             {
                 self.composer_focused = true
             }
@@ -224,6 +257,43 @@ impl App {
                 self.preferences.compact_messages = !self.preferences.compact_messages;
                 self.save_preferences();
             }
+            KeyCode::Char('d')
+                if self.section == Section::Settings && self.selected_setting == 4 =>
+            {
+                self.toggle_chat_feature(
+                    ChatFeature::DisappearingMessages,
+                    !self.chat_features.disappearing_messages,
+                )
+            }
+            KeyCode::Char('x')
+                if self.section == Section::Settings && self.selected_setting == 4 =>
+            {
+                self.toggle_chat_feature(
+                    ChatFeature::FullDeletion,
+                    !self.chat_features.full_deletion,
+                )
+            }
+            KeyCode::Char('r')
+                if self.section == Section::Settings && self.selected_setting == 4 =>
+            {
+                self.toggle_chat_feature(ChatFeature::Reactions, !self.chat_features.reactions)
+            }
+            KeyCode::Char('v')
+                if self.section == Section::Settings && self.selected_setting == 4 =>
+            {
+                self.toggle_chat_feature(
+                    ChatFeature::VoiceMessages,
+                    !self.chat_features.voice_messages,
+                )
+            }
+            KeyCode::Char('f')
+                if self.section == Section::Settings && self.selected_setting == 4 =>
+            {
+                self.toggle_chat_feature(
+                    ChatFeature::FilesAndMedia,
+                    !self.chat_features.files_and_media,
+                )
+            }
             KeyCode::Tab => self.events.send(AppEvent::ToggleSection),
             KeyCode::Char('1') => self.events.send(AppEvent::SelectSection(Section::Chats)),
             KeyCode::Char('2') => self.events.send(AppEvent::SelectSection(Section::Profiles)),
@@ -232,6 +302,9 @@ impl App {
             KeyCode::Down | KeyCode::Char('j') => self.events.send(AppEvent::SelectNext),
             KeyCode::Left | KeyCode::Char('h') => self.events.send(AppEvent::PreviousSection),
             KeyCode::Right | KeyCode::Char('l') => self.events.send(AppEvent::NextSection),
+            KeyCode::PageUp if self.section == Section::Chats => self.scroll_chat_up(5),
+            KeyCode::PageDown if self.section == Section::Chats => self.scroll_chat_down(5),
+            KeyCode::End if self.section == Section::Chats => self.jump_to_latest(),
             _ => {}
         }
         Ok(())
@@ -239,6 +312,14 @@ impl App {
 
     fn handle_mouse_event(&mut self, kind: MouseEventKind, column: u16, row: u16) {
         if matches!(kind, MouseEventKind::Down(MouseButton::Left)) {
+            if self
+                .jump_to_latest_area
+                .get()
+                .contains((column, row).into())
+            {
+                self.jump_to_latest();
+                return;
+            }
             if self.send_area.get().contains((column, row).into()) {
                 self.send_message();
                 return;
@@ -250,6 +331,14 @@ impl App {
         }
         let area = self.area.get();
         let sidebar_width = area.width * 32 / 100;
+        if self.section == Section::Chats && column >= area.x + sidebar_width {
+            match kind {
+                MouseEventKind::ScrollUp => self.scroll_chat_up(3),
+                MouseEventKind::ScrollDown => self.scroll_chat_down(3),
+                _ => {}
+            }
+            return;
+        }
         if column >= area.x + sidebar_width || row < area.y || row >= area.bottom() {
             return;
         }
@@ -279,6 +368,8 @@ impl App {
     }
 
     fn handle_app_event(&mut self, event: AppEvent) {
+        let previous_section = self.section;
+        let previous_chat = self.selected_chat_ref().cloned();
         match event {
             AppEvent::Quit => self.running = false,
             AppEvent::ToggleSection => {
@@ -318,6 +409,12 @@ impl App {
                 }
             }
         }
+        if self.section == Section::Chats
+            && (previous_section != Section::Chats
+                || previous_chat.as_ref() != self.selected_chat_ref())
+        {
+            self.jump_to_latest();
+        }
     }
 
     fn selected_index_mut(&mut self) -> &mut usize {
@@ -330,7 +427,7 @@ impl App {
 
     fn item_count(&self) -> usize {
         match self.section {
-            Section::Chats => self.chats.len(),
+            Section::Chats => self.chats.len() + usize::from(self.active_user().is_some()),
             Section::Profiles => self.profiles.len().saturating_add(1),
             Section::Settings => Self::SETTINGS.len(),
         }
@@ -353,6 +450,8 @@ impl App {
                     self.chats = chats;
                     self.messages.clear();
                     self.loaded_chat = None;
+                    self.invitation_link = None;
+                    self.invitation_error = None;
                     self.notice = Some("Profile activated".into());
                     for profile in &mut self.profiles {
                         profile.active = matches!(&self.startup, StartupState::Ready(active) if active.id == profile.id);
@@ -369,23 +468,55 @@ impl App {
                     self.chats = chats;
                     self.messages.clear();
                     self.loaded_chat = None;
+                    self.invitation_link = None;
+                    self.invitation_error = None;
                     self.notice = Some("Profile created".into());
                     self.sync_selected_profile();
                 }
                 SimplexEvent::SettingChanged(message) => self.notice = Some(message),
                 SimplexEvent::AutoDeleteLoaded(seconds) => self.auto_delete_seconds = seconds,
+                SimplexEvent::ServersLoaded(servers) => self.smp_servers = servers,
+                SimplexEvent::ChatFeaturesLoaded(features) => self.chat_features = features,
+                SimplexEvent::InvitationCreated(link) => {
+                    self.invitation_link = Some(link);
+                    self.invitation_loading = false;
+                    self.invitation_error = None;
+                }
+                SimplexEvent::InvitationFailed(error) => {
+                    self.invitation_loading = false;
+                    self.invitation_error = Some(error);
+                }
                 SimplexEvent::ChatLoaded { chat_ref, messages } => {
                     if self.selected_chat_ref() == Some(&chat_ref) {
                         self.loaded_chat = Some(chat_ref);
                         self.chat_loading = false;
                         self.messages = messages;
                         self.chat_error = None;
+                        self.chat_scroll = 0;
+                        self.new_messages_below = 0;
+                    }
+                }
+                SimplexEvent::ChatMarkedRead(chat_ref) => {
+                    if let Some(chat) = self.chats.iter_mut().find(|chat| chat.chat_ref == chat_ref)
+                    {
+                        chat.unread_count = 0;
                     }
                 }
                 SimplexEvent::MessageReceived { chat_ref, message } => {
-                    if self.loaded_chat.as_ref() == Some(&chat_ref) {
+                    let chat_is_visible = self.section == Section::Chats
+                        && self.selected_chat_ref() == Some(&chat_ref)
+                        && self.loaded_chat.as_ref() == Some(&chat_ref)
+                        && !self.chat_loading;
+                    if chat_is_visible {
                         if !self.messages.iter().any(|item| item.id == message.id) {
                             self.messages.push(message);
+                            self.chat_scroll = self.chat_scroll.saturating_add(1);
+                            self.new_messages_below = self.new_messages_below.saturating_add(1);
+                            if let Some(chat) =
+                                self.chats.iter_mut().find(|chat| chat.chat_ref == chat_ref)
+                            {
+                                chat.unread_count = chat.unread_count.saturating_add(1);
+                            }
                         }
                     } else if let Some(chat) =
                         self.chats.iter_mut().find(|chat| chat.chat_ref == chat_ref)
@@ -420,16 +551,31 @@ impl App {
                 SimplexEvent::Failed(error) => self.startup = StartupState::Failed(error),
             }
         }
-        if let Some(chat_ref) = self.selected_chat_ref().cloned()
-            && self.loaded_chat.as_ref() != Some(&chat_ref)
+        if self.section == Section::Chats
+            && let Some(chat_ref) = self.selected_chat_ref().cloned()
         {
-            self.loaded_chat = Some(chat_ref.clone());
-            self.messages.clear();
-            self.chat_loading = true;
-            self.chat_error = None;
-            let _ = self
-                .simplex_commands
-                .send(SimplexCommand::LoadChat(chat_ref));
+            if self.loaded_chat.as_ref() != Some(&chat_ref) {
+                self.loaded_chat = Some(chat_ref.clone());
+                self.messages.clear();
+                self.chat_loading = true;
+                self.chat_error = None;
+                let _ = self
+                    .simplex_commands
+                    .send(SimplexCommand::LoadChat(chat_ref));
+            } else if !self.chat_loading && self.chat_error.is_none() && self.chat_scroll == 0 {
+                let unread = self
+                    .chats
+                    .get(self.selected_chat)
+                    .is_some_and(|chat| chat.unread_count > 0);
+                if unread {
+                    if let Some(chat) = self.chats.get_mut(self.selected_chat) {
+                        chat.unread_count = 0;
+                    }
+                    let _ = self
+                        .simplex_commands
+                        .send(SimplexCommand::MarkChatRead(chat_ref));
+                }
+            }
         }
     }
 
@@ -457,6 +603,67 @@ impl App {
             self.sending = false;
             self.chat_error = Some("SimpleX worker is not available".into());
         }
+    }
+
+    fn scroll_chat_up(&mut self, amount: usize) {
+        let max = self.max_chat_scroll.get();
+        self.chat_scroll = self.chat_scroll.saturating_add(amount).min(max);
+    }
+
+    fn scroll_chat_down(&mut self, amount: usize) {
+        self.chat_scroll = self.chat_scroll.saturating_sub(amount);
+        if self.chat_scroll == 0 {
+            self.new_messages_below = 0;
+        }
+    }
+
+    fn jump_to_latest(&mut self) {
+        self.chat_scroll = 0;
+        self.new_messages_below = 0;
+    }
+
+    fn show_invitation(&mut self) {
+        if self.active_user().is_none() {
+            self.notice = Some("Create a profile first".into());
+            return;
+        }
+        self.selected_chat = self.chats.len();
+        if self.invitation_link.is_none() {
+            self.create_invitation();
+        }
+    }
+
+    fn create_invitation(&mut self) {
+        let Some(user_id) = self.active_user().map(|user| user.id) else {
+            self.notice = Some("Create a profile first".into());
+            return;
+        };
+        if self.invitation_loading {
+            return;
+        }
+        self.invitation_loading = true;
+        self.invitation_error = None;
+        if self
+            .simplex_commands
+            .send(SimplexCommand::CreateInvitation { user_id })
+            .is_err()
+        {
+            self.invitation_loading = false;
+            self.invitation_error = Some("SimpleX worker is not available".into());
+        }
+    }
+
+    fn toggle_chat_feature(&mut self, feature: ChatFeature, enabled: bool) {
+        let Some(user_id) = self.active_user().map(|user| user.id) else {
+            self.notice = Some("Create a profile first".into());
+            return;
+        };
+        self.notice = Some("Updating chat feature…".into());
+        let _ = self.simplex_commands.send(SimplexCommand::SetChatFeature {
+            user_id,
+            feature,
+            enabled,
+        });
     }
 
     fn activate_profile(&mut self) {
@@ -666,5 +873,61 @@ mod tests {
         };
         assert_eq!(chat_ref, ChatRef("#3".into()));
         assert_eq!(text, "hello team");
+    }
+
+    #[tokio::test]
+    async fn incoming_message_only_clears_when_its_chat_is_visible() {
+        let (event_sender, event_receiver) = mpsc::channel();
+        let mut app = App {
+            section: Section::Settings,
+            chats: vec![ChatSummary {
+                chat_ref: ChatRef("@7".into()),
+                display_name: "alice".into(),
+                unread_count: 0,
+            }],
+            loaded_chat: Some(ChatRef("@7".into())),
+            simplex_events: event_receiver,
+            ..App::default()
+        };
+        event_sender
+            .send(SimplexEvent::MessageReceived {
+                chat_ref: ChatRef("@7".into()),
+                message: Message {
+                    id: 1,
+                    text: "hello".into(),
+                    timestamp: String::new(),
+                    outgoing: false,
+                },
+            })
+            .unwrap();
+
+        app.tick();
+
+        assert_eq!(app.chats[0].unread_count, 1);
+        assert!(app.messages.is_empty());
+    }
+
+    #[tokio::test]
+    async fn returning_to_an_already_loaded_chat_marks_it_read() {
+        let (commands, command_receiver) = mpsc::channel();
+        let mut app = App {
+            section: Section::Chats,
+            chats: vec![ChatSummary {
+                chat_ref: ChatRef("@7".into()),
+                display_name: "alice".into(),
+                unread_count: 2,
+            }],
+            loaded_chat: Some(ChatRef("@7".into())),
+            simplex_commands: commands,
+            ..App::default()
+        };
+
+        app.tick();
+
+        assert_eq!(app.chats[0].unread_count, 0);
+        let SimplexCommand::MarkChatRead(chat_ref) = command_receiver.try_recv().unwrap() else {
+            panic!("expected mark-read command")
+        };
+        assert_eq!(chat_ref, ChatRef("@7".into()));
     }
 }

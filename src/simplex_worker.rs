@@ -15,11 +15,38 @@ use crate::{
 #[derive(Debug)]
 pub enum SimplexCommand {
     LoadChat(ChatRef),
-    SendMessage { chat_ref: ChatRef, text: String },
+    MarkChatRead(ChatRef),
+    SendMessage {
+        chat_ref: ChatRef,
+        text: String,
+    },
     ActivateProfile(i64),
     CreateProfile(String),
-    SetNotifications { user_id: i64, enabled: bool },
-    SetAutoDelete { user_id: i64, seconds: i64 },
+    SetNotifications {
+        user_id: i64,
+        enabled: bool,
+    },
+    SetAutoDelete {
+        user_id: i64,
+        seconds: i64,
+    },
+    CreateInvitation {
+        user_id: i64,
+    },
+    SetChatFeature {
+        user_id: i64,
+        feature: ChatFeature,
+        enabled: bool,
+    },
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum ChatFeature {
+    DisappearingMessages,
+    FullDeletion,
+    Reactions,
+    VoiceMessages,
+    FilesAndMedia,
 }
 
 pub fn spawn(api: Arc<SimplexApi>, sender: Sender<SimplexEvent>) -> Sender<SimplexCommand> {
@@ -65,6 +92,8 @@ fn run(
     };
     controller.command("/_start").map_err(|e| e.to_string())?;
     send_auto_delete(&controller, sender, user.id)?;
+    send_servers(&controller, sender, user.id)?;
+    load_chat_features(&controller, sender, user.id, true)?;
     let chats = load_chats(&controller, user.id)?;
     sender
         .send(SimplexEvent::Ready { user, chats })
@@ -90,11 +119,18 @@ fn command_loop(
                     {
                         Ok((chat_ref, messages)) => SimplexEvent::ChatLoaded { chat_ref, messages },
                         Err(error) => SimplexEvent::ChatLoadFailed {
-                            chat_ref: requested_ref,
+                            chat_ref: requested_ref.clone(),
                             error,
                         },
                     };
+                    let loaded = matches!(event, SimplexEvent::ChatLoaded { .. });
                     sender.send(event).map_err(|e| e.to_string())?;
+                    if loaded {
+                        mark_chat_read(&controller, sender, &requested_ref)?;
+                    }
+                }
+                SimplexCommand::MarkChatRead(chat_ref) => {
+                    mark_chat_read(&controller, sender, &chat_ref)?;
                 }
                 SimplexCommand::SendMessage { chat_ref, text } => {
                     let command = if let Some(id) = chat_ref.0.strip_prefix('*') {
@@ -152,6 +188,8 @@ fn command_loop(
                             .ok_or("SimpleX did not activate the selected profile")?;
                         controller.command("/_start").map_err(|e| e.to_string())?;
                         send_auto_delete(&controller, sender, user.id)?;
+                        send_servers(&controller, sender, user.id)?;
+                        load_chat_features(&controller, sender, user.id, true)?;
                         let chats = load_chats(&controller, user.id)?;
                         Ok::<_, String>(SimplexEvent::ProfileActivated { user, chats })
                     })();
@@ -172,6 +210,8 @@ fn command_loop(
                             .ok_or("SimpleX did not create the profile")?;
                         controller.command("/_start").map_err(|e| e.to_string())?;
                         send_auto_delete(&controller, sender, user.id)?;
+                        send_servers(&controller, sender, user.id)?;
+                        load_chat_features(&controller, sender, user.id, true)?;
                         let profiles = load_profiles(&controller)?;
                         let chats = load_chats(&controller, user.id)?;
                         Ok::<_, String>(SimplexEvent::ProfileCreated {
@@ -208,6 +248,37 @@ fn command_loop(
                         ))
                         .map_err(|e| e.to_string())?;
                 }
+                SimplexCommand::CreateInvitation { user_id } => {
+                    let event = controller
+                        .command(&format!("/_connect {user_id} incognito=off"))
+                        .map_err(|e| e.to_string())
+                        .and_then(|value| chat::invitation_link(&value))
+                        .map(SimplexEvent::InvitationCreated)
+                        .unwrap_or_else(SimplexEvent::InvitationFailed);
+                    sender.send(event).map_err(|e| e.to_string())?;
+                }
+                SimplexCommand::SetChatFeature {
+                    user_id,
+                    feature,
+                    enabled,
+                } => {
+                    let result = update_chat_feature(&controller, user_id, feature, enabled);
+                    match result {
+                        Ok(features) => {
+                            sender
+                                .send(SimplexEvent::ChatFeaturesLoaded(features))
+                                .map_err(|e| e.to_string())?;
+                            sender
+                                .send(SimplexEvent::SettingChanged("Chat feature updated".into()))
+                                .map_err(|e| e.to_string())?;
+                        }
+                        Err(error) => sender
+                            .send(SimplexEvent::SettingChanged(format!(
+                                "Could not update chat feature: {error}"
+                            )))
+                            .map_err(|e| e.to_string())?,
+                    }
+                }
             }
         }
         if let Some(value) = controller
@@ -221,6 +292,121 @@ fn command_loop(
             }
         }
     }
+}
+
+fn mark_chat_read(
+    controller: &crate::simplex::SimplexController,
+    sender: &Sender<SimplexEvent>,
+    chat_ref: &ChatRef,
+) -> Result<(), String> {
+    let response = controller
+        .command(&format!("/_read chat {}", chat_ref.0))
+        .map_err(|e| e.to_string())?;
+    ensure_ok(&response, "mark chat as read")?;
+    sender
+        .send(SimplexEvent::ChatMarkedRead(chat_ref.clone()))
+        .map_err(|e| e.to_string())
+}
+
+fn load_chat_features(
+    controller: &crate::simplex::SimplexController,
+    sender: &Sender<SimplexEvent>,
+    user_id: i64,
+    enforce_calls_disabled: bool,
+) -> Result<(), String> {
+    let response = controller.command("/profile").map_err(|e| e.to_string())?;
+    let (mut profile, features) = chat::profile_and_features(&response)?;
+    if enforce_calls_disabled && preference_allow(&profile, "calls") != Some("no") {
+        set_profile_preference(&mut profile, "calls", false)?;
+        update_profile(controller, user_id, &profile)?;
+    }
+    sender
+        .send(SimplexEvent::ChatFeaturesLoaded(features))
+        .map_err(|e| e.to_string())
+}
+
+fn update_chat_feature(
+    controller: &crate::simplex::SimplexController,
+    user_id: i64,
+    feature: ChatFeature,
+    enabled: bool,
+) -> Result<chat::ChatFeatures, String> {
+    let response = controller.command("/profile").map_err(|e| e.to_string())?;
+    let (mut profile, _) = chat::profile_and_features(&response)?;
+    let name = match feature {
+        ChatFeature::DisappearingMessages => "timedMessages",
+        ChatFeature::FullDeletion => "fullDelete",
+        ChatFeature::Reactions => "reactions",
+        ChatFeature::VoiceMessages => "voice",
+        ChatFeature::FilesAndMedia => "files",
+    };
+    set_profile_preference(&mut profile, name, enabled)?;
+    set_profile_preference(&mut profile, "calls", false)?;
+    update_profile(controller, user_id, &profile)?;
+    let synthetic = serde_json::json!({"result": {"type": "userProfile", "profile": profile}});
+    chat::profile_and_features(&synthetic).map(|(_, features)| features)
+}
+
+fn preference_allow<'a>(profile: &'a serde_json::Value, name: &str) -> Option<&'a str> {
+    profile
+        .pointer(&format!("/preferences/{name}/allow"))
+        .and_then(serde_json::Value::as_str)
+}
+
+fn set_profile_preference(
+    profile: &mut serde_json::Value,
+    name: &str,
+    enabled: bool,
+) -> Result<(), String> {
+    let profile = profile
+        .as_object_mut()
+        .ok_or("profile response is not an object")?;
+    if !profile
+        .get("preferences")
+        .is_some_and(|value| value.is_object())
+    {
+        profile.insert("preferences".into(), serde_json::json!({}));
+    }
+    let preferences = profile
+        .get_mut("preferences")
+        .and_then(serde_json::Value::as_object_mut)
+        .ok_or("profile preferences are not an object")?;
+    let mut preference = preferences
+        .get(name)
+        .and_then(serde_json::Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    preference.insert(
+        "allow".into(),
+        serde_json::Value::String(if enabled { "yes" } else { "no" }.into()),
+    );
+    preferences.insert(name.into(), serde_json::Value::Object(preference));
+    Ok(())
+}
+
+fn update_profile(
+    controller: &crate::simplex::SimplexController,
+    user_id: i64,
+    profile: &serde_json::Value,
+) -> Result<(), String> {
+    let response = controller
+        .command(&format!("/_profile {user_id} {profile}"))
+        .map_err(|e| e.to_string())?;
+    ensure_ok(&response, "chat preferences")
+}
+
+fn send_servers(
+    controller: &crate::simplex::SimplexController,
+    sender: &Sender<SimplexEvent>,
+    user_id: i64,
+) -> Result<(), String> {
+    let response = controller
+        .command(&format!("/_servers {user_id}"))
+        .map_err(|e| e.to_string())?;
+    let servers = chat::smp_servers(&response)?;
+    sender
+        .send(SimplexEvent::ServersLoaded(servers))
+        .map_err(|e| e.to_string())
 }
 
 fn load_profiles(

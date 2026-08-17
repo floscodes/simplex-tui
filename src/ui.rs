@@ -1,3 +1,4 @@
+use qrcode::QrCode;
 use ratatui::{
     buffer::Buffer,
     layout::{Alignment, Constraint, Direction, Layout, Rect},
@@ -5,6 +6,7 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, BorderType, Borders, List, ListItem, Padding, Paragraph, Tabs, Widget, Wrap},
 };
+use tui_qrcode::{Colors, QrCodeWidget, Scaling};
 
 use crate::app::{App, InputMode, Section, StartupState};
 use crate::preferences::Theme;
@@ -29,6 +31,7 @@ impl Widget for &App {
         self.area.set(area);
         self.composer_area.set(Rect::default());
         self.send_area.set(Rect::default());
+        self.jump_to_latest_area.set(Rect::default());
         let columns = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Percentage(32), Constraint::Percentage(68)])
@@ -87,6 +90,7 @@ fn render_sidebar(app: &App, area: Rect, buf: &mut Buffer) {
                         format!("{} ({})", chat.display_name, chat.unread_count)
                     }
                 })
+                .chain(app.active_user().map(|_| "＋ Invite contact".to_owned()))
                 .collect(),
             app.selected_chat,
         ),
@@ -113,15 +117,25 @@ fn render_sidebar(app: &App, area: Rect, buf: &mut Buffer) {
     };
     let items = entries.iter().enumerate().map(|(index, name)| {
         let marker = if index == selected { "● " } else { "  " };
+        let unread = app.section == Section::Chats
+            && app
+                .chats
+                .get(index)
+                .is_some_and(|chat| chat.unread_count > 0);
+        let style = if unread {
+            Style::default()
+                .fg(Color::LightBlue)
+                .add_modifier(Modifier::BOLD)
+        } else if index == selected {
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+        };
         ListItem::new(Line::from(vec![Span::styled(
             format!("{marker}{name}"),
-            if index == selected {
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default()
-            },
+            style,
         )]))
     });
 
@@ -170,6 +184,10 @@ fn render_profile(app: &App, area: Rect, buf: &mut Buffer) {
 }
 
 fn render_chat(app: &App, area: Rect, buf: &mut Buffer) {
+    if app.active_user().is_some() && app.selected_chat == app.chats.len() {
+        render_invitation(app, area, buf);
+        return;
+    }
     let Some(summary) = app.chats.get(app.selected_chat) else {
         let (title, text) = match &app.startup {
             StartupState::Loading => ("SimpleX", "Opening the local SimpleX database…"),
@@ -182,7 +200,7 @@ fn render_chat(app: &App, area: Rect, buf: &mut Buffer) {
                 if user.display_name.is_empty() {
                     "No conversations yet."
                 } else {
-                    "No conversations yet. Create or connect to a contact to begin."
+                    "No conversations yet.\n\nPress n to create a one-time invitation link."
                 },
             ),
             StartupState::Failed(error) => ("SimpleX error", error.as_str()),
@@ -212,10 +230,10 @@ fn render_chat(app: &App, area: Rect, buf: &mut Buffer) {
         .fg(Color::DarkGray)
         .render(rows[0], buf);
     let available = usize::from(rows[1].height);
-    let start = app.messages.len().saturating_sub(available);
-    let lines: Vec<Line> = app.messages[start..]
+    let message_lines: Vec<Vec<Line>> = app
+        .messages
         .iter()
-        .flat_map(|message| {
+        .map(|message| {
             let time = message.timestamp.get(11..16).unwrap_or("");
             let prefix = if message.outgoing { "You" } else { chat };
             let color = if message.outgoing {
@@ -223,20 +241,61 @@ fn render_chat(app: &App, area: Rect, buf: &mut Buffer) {
             } else {
                 Color::Rgb(70, 160, 255)
             };
-            let message_line = Line::from(vec![
+            let label = format!("{time} {prefix}: ");
+            let mut text_lines = message.text.split('\n');
+            let first = text_lines.next().unwrap_or_default().trim_end_matches('\r');
+            let mut rendered = vec![Line::from(vec![
                 Span::styled(
-                    format!("{time} {prefix}: "),
+                    label.clone(),
                     Style::default().fg(color).add_modifier(Modifier::BOLD),
                 ),
-                Span::raw(&message.text),
-            ]);
-            if app.preferences.compact_messages {
-                vec![message_line]
-            } else {
-                vec![message_line, Line::default()]
+                Span::raw(first.to_owned()),
+            ])];
+            rendered.extend(text_lines.map(|line| {
+                Line::from(vec![
+                    Span::raw(" ".repeat(label.chars().count())),
+                    Span::raw(line.trim_end_matches('\r').to_owned()),
+                ])
+            }));
+            if !app.preferences.compact_messages {
+                rendered.push(Line::default());
             }
+            rendered
         })
         .collect();
+    let text_width = usize::from(rows[1].width.saturating_sub(1).max(1));
+    let message_heights: Vec<usize> = message_lines
+        .iter()
+        .map(|lines| {
+            lines
+                .iter()
+                .map(|line| line.width().max(1).div_ceil(text_width))
+                .sum()
+        })
+        .collect();
+    let mut top_page_messages: usize = 0;
+    let mut top_page_height: usize = 0;
+    for &height in &message_heights {
+        if top_page_messages > 0 && top_page_height.saturating_add(height) > available {
+            break;
+        }
+        top_page_messages += 1;
+        top_page_height = top_page_height.saturating_add(height);
+        if top_page_height >= available {
+            break;
+        }
+    }
+    let max_scroll = app.messages.len().saturating_sub(top_page_messages);
+    app.max_chat_scroll.set(max_scroll);
+    let effective_scroll = app.chat_scroll.min(max_scroll);
+    let visible_end = app.messages.len().saturating_sub(effective_scroll);
+    let all_lines: Vec<Line> = message_lines[..visible_end]
+        .iter()
+        .flatten()
+        .cloned()
+        .collect();
+    let line_start = all_lines.len().saturating_sub(available);
+    let lines = all_lines[line_start..].to_vec();
     let content = if let Some(error) = &app.chat_error {
         Paragraph::new(error.as_str()).fg(Color::Red)
     } else if app.chat_loading || app.loaded_chat.as_ref() != Some(&summary.chat_ref) {
@@ -247,6 +306,38 @@ fn render_chat(app: &App, area: Rect, buf: &mut Buffer) {
         Paragraph::new(lines)
     };
     content.wrap(Wrap { trim: false }).render(rows[1], buf);
+
+    let total_height = message_heights.iter().sum::<usize>();
+    let height_before_end = message_heights[..visible_end].iter().sum::<usize>();
+    let top_line = height_before_end.saturating_sub(available);
+    render_chat_scrollbar(rows[1], buf, total_height, available, top_line);
+
+    if app.chat_scroll > 0 && rows[1].width > 4 && rows[1].height > 0 {
+        let label = if app.new_messages_below > 0 {
+            format!(" ↓ {} new ", app.new_messages_below)
+        } else {
+            " ↓ latest ".into()
+        };
+        let width = u16::try_from(label.chars().count())
+            .unwrap_or(rows[1].width)
+            .min(rows[1].width);
+        let jump_area = Rect::new(
+            rows[1].right().saturating_sub(width),
+            rows[1].bottom().saturating_sub(1),
+            width,
+            1,
+        );
+        app.jump_to_latest_area.set(jump_area);
+        Paragraph::new(label)
+            .alignment(Alignment::Center)
+            .style(
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            )
+            .render(jump_area, buf);
+    }
 
     let composer_columns =
         Layout::horizontal([Constraint::Min(10), Constraint::Length(10)]).split(rows[2]);
@@ -285,13 +376,104 @@ fn render_chat(app: &App, area: Rect, buf: &mut Buffer) {
         .render(composer_columns[1], buf);
 
     if let Some(footer) = rows.last() {
-        Paragraph::new(
-            "Enter: send · Shift+Enter: newline · Alt+Enter: fallback · Esc: leave composer",
-        )
+        Paragraph::new("Enter: send · Shift+Enter: newline · PgUp/PgDn: scroll · End: latest")
+            .alignment(Alignment::Center)
+            .fg(Color::DarkGray)
+            .render(*footer, buf);
+    }
+}
+
+fn render_chat_scrollbar(
+    area: Rect,
+    buf: &mut Buffer,
+    content_height: usize,
+    viewport_height: usize,
+    top_line: usize,
+) {
+    let track_height = usize::from(area.height);
+    if track_height == 0 || content_height <= viewport_height {
+        return;
+    }
+    let minimum_thumb = 2.min(track_height);
+    let thumb_height = viewport_height
+        .saturating_mul(track_height)
+        .div_ceil(content_height)
+        .max(minimum_thumb)
+        .min(track_height);
+    let max_top = content_height.saturating_sub(viewport_height);
+    let travel = track_height.saturating_sub(thumb_height);
+    let thumb_offset = top_line
+        .min(max_top)
+        .saturating_mul(travel)
+        .checked_div(max_top)
+        .unwrap_or(0);
+    let x = area.right().saturating_sub(1);
+    for offset in 0..track_height {
+        let y = area.y.saturating_add(offset as u16);
+        let thumb = offset >= thumb_offset && offset < thumb_offset + thumb_height;
+        buf[(x, y)]
+            .set_symbol(if thumb { "█" } else { "│" })
+            .set_style(Style::default().fg(if thumb {
+                Color::Cyan
+            } else {
+                Color::Rgb(45, 50, 60)
+            }));
+    }
+}
+
+fn render_invitation(app: &App, area: Rect, buf: &mut Buffer) {
+    let block = panel("Invite contact").padding(Padding::new(2, 2, 1, 1));
+    let inner = block.inner(area);
+    block.render(area, buf);
+
+    if app.invitation_loading {
+        Paragraph::new("Creating a secure one-time invitation via SimpleX…")
+            .alignment(Alignment::Center)
+            .fg(Color::Cyan)
+            .render(inner, buf);
+        return;
+    }
+    if let Some(error) = &app.invitation_error {
+        Paragraph::new(format!(
+            "Could not create invitation:\n\n{error}\n\nPress r to retry."
+        ))
+        .fg(Color::Red)
+        .wrap(Wrap { trim: false })
+        .render(inner, buf);
+        return;
+    }
+    let Some(link) = &app.invitation_link else {
+        Paragraph::new("Press Enter to create a one-time invitation link.")
+            .alignment(Alignment::Center)
+            .render(inner, buf);
+        return;
+    };
+
+    let rows = Layout::vertical([
+        Constraint::Min(10),
+        Constraint::Length(1),
+        Constraint::Length(6),
+        Constraint::Length(1),
+    ])
+    .split(inner);
+    if let Ok(code) = QrCode::new(link.as_bytes()) {
+        QrCodeWidget::new(code)
+            .scaling(Scaling::Max)
+            .colors(Colors::Inverted)
+            .render(rows[0], buf);
+    }
+    Paragraph::new("Scan with SimpleX Chat")
+        .alignment(Alignment::Center)
+        .fg(Color::Cyan)
+        .render(rows[1], buf);
+    Paragraph::new(link.as_str())
+        .alignment(Alignment::Center)
+        .wrap(Wrap { trim: false })
+        .render(rows[2], buf);
+    Paragraph::new("One-time link · r: create a new invitation")
         .alignment(Alignment::Center)
         .fg(Color::DarkGray)
-        .render(*footer, buf);
-    }
+        .render(rows[3], buf);
 }
 
 fn render_settings(app: &App, area: Rect, buf: &mut Buffer) {
@@ -316,6 +498,28 @@ fn render_settings(app: &App, area: Rect, buf: &mut Buffer) {
             app.preferences.theme.label(),
             enabled(app.preferences.compact_messages)
         ),
+        4 => format!(
+            "Defaults for new contacts\n\nDisappearing messages  {}   [d]\nFull deletion          {}   [x]\nMessage reactions      {}   [r]\nVoice messages         {}   [v]\nFiles and media        {}   [f]\nAudio/video calls      Disabled (fixed)\n\nThese preferences are negotiated by SimpleX. Their protocol events are not displayed as chat messages.",
+            enabled(app.chat_features.disappearing_messages),
+            enabled(app.chat_features.full_deletion),
+            enabled(app.chat_features.reactions),
+            enabled(app.chat_features.voice_messages),
+            enabled(app.chat_features.files_and_media),
+        ),
+        5 => {
+            let servers = if app.smp_servers.is_empty() {
+                "No SMP servers loaded.".into()
+            } else {
+                app.smp_servers
+                    .iter()
+                    .map(|server| server.split('@').nth(1).unwrap_or(server).replace(',', "\n    onion: "))
+                    .collect::<Vec<_>>()
+                    .join("\n\n")
+            };
+            format!(
+                "Servers configured for the active profile\n\n{servers}\n\nNew profiles use the official SimpleX preset. Invitations use this profile-specific server configuration."
+            )
+        }
         _ => "simplex-tui\nA private terminal client powered by the official SimpleX Chat library.\n\nSimpleX data and application state are stored under ~/.simplex-tui.".into(),
     };
     Paragraph::new(body)
