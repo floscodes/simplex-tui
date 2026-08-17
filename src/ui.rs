@@ -276,6 +276,7 @@ fn render_chat(app: &App, area: Rect, buf: &mut Buffer) {
     let rows = Layout::vertical([
         Constraint::Length(1),
         Constraint::Min(1),
+        Constraint::Length(1),
         Constraint::Length(5),
         Constraint::Length(1),
     ])
@@ -393,7 +394,7 @@ fn render_chat(app: &App, area: Rect, buf: &mut Buffer) {
     }
 
     let composer_columns =
-        Layout::horizontal([Constraint::Min(10), Constraint::Length(10)]).split(rows[2]);
+        Layout::horizontal([Constraint::Min(10), Constraint::Length(10)]).split(rows[3]);
     app.composer_area.set(composer_columns[0]);
     app.send_area.set(composer_columns[1]);
     let mut draft = app.composer.clone();
@@ -413,20 +414,31 @@ fn render_chat(app: &App, area: Rect, buf: &mut Buffer) {
         )
         .wrap(Wrap { trim: false })
         .render(composer_columns[0], buf);
-    let button_text = if app.sending { "Sending…" } else { "Send" };
-    Paragraph::new(button_text)
-        .alignment(Alignment::Center)
-        .block(
-            Block::bordered()
-                .border_type(BorderType::Rounded)
-                .title(" ↵ ")
-                .border_style(Style::default().fg(if app.sending {
-                    Color::DarkGray
-                } else {
-                    Color::Rgb(40, 210, 130)
-                })),
-        )
-        .render(composer_columns[1], buf);
+    let button_color = if app.sending {
+        Color::DarkGray
+    } else {
+        Color::Rgb(40, 210, 130)
+    };
+    let button = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(button_color));
+    let button_inner = button.inner(composer_columns[1]);
+    button.render(composer_columns[1], buf);
+    let symbol_style = Style::default()
+        .fg(button_color)
+        .add_modifier(Modifier::BOLD);
+    let symbol_area = Rect::new(
+        button_inner.x,
+        button_inner.y + button_inner.height.saturating_sub(1) / 2,
+        button_inner.width,
+        1.min(button_inner.height),
+    );
+    Paragraph::new(Span::styled(
+        if app.sending { "…" } else { "⌲" },
+        symbol_style,
+    ))
+    .alignment(Alignment::Center)
+    .render(symbol_area, buf);
 
     if let Some(footer) = rows.last() {
         Paragraph::new("Enter: send · Shift+Enter: newline · PgUp/PgDn: scroll · End: latest")
@@ -487,7 +499,10 @@ fn render_message_bubbles(
             continue;
         }
         let x = if message.outgoing {
-            area.right().saturating_sub(1).saturating_sub(width)
+            area.right()
+                .saturating_sub(3)
+                .saturating_sub(width)
+                .max(area.x)
         } else {
             area.x
         };
