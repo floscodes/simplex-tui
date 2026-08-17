@@ -149,6 +149,14 @@ impl App {
     }
 
     pub async fn run(mut self, mut terminal: DefaultTerminal) -> color_eyre::Result<()> {
+        // This is the asynchronous bridge between the TUI and the synchronous
+        // SimpleX/Haskell API. Ratatui renders the current `App` state here and
+        // Crossterm supplies terminal input, while `simplex_worker` owns the
+        // blocking FFI calls on a dedicated OS thread. The two sides communicate
+        // exclusively through command/event channels: UI actions enqueue
+        // `SimplexCommand`s, and periodic ticks project returned `SimplexEvent`s
+        // into `App`. This keeps the terminal responsive and makes this loop the
+        // only place from which UI state is mutated.
         while self.running {
             terminal.draw(|frame| frame.render_widget(&self, frame.area()))?;
             match self.events.next().await? {
