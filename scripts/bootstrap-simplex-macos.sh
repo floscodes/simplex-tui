@@ -5,7 +5,6 @@ root_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source_dir="$root_dir/vendor/simplex-chat"
 simplex_chat_revision="ec6e975001861d494360cda4aa267747d3a14272"
 required_ghc="9.6.3"
-required_cabal="3.10.1.0"
 
 [[ "$(uname -s)" == "Darwin" ]] || { echo "This bootstrap requires macOS." >&2; exit 1; }
 
@@ -35,7 +34,9 @@ fi
 export PATH="${HOME}/.ghcup/bin:${PATH}"
 
 ghcup whereis ghc "$required_ghc" >/dev/null 2>&1 || ghcup install ghc "$required_ghc" --no-set
-ghcup whereis cabal "$required_cabal" >/dev/null 2>&1 || ghcup install cabal "$required_cabal" --no-set
+if ! command -v cabal >/dev/null 2>&1; then
+  ghcup install cabal --set
+fi
 
 if [[ ! -d "$source_dir/.git" ]]; then
   mkdir -p "$root_dir/vendor"
@@ -45,8 +46,8 @@ git -C "$source_dir" fetch origin stable
 git -C "$source_dir" checkout --detach "$simplex_chat_revision"
 
 cd "$source_dir"
-ghcup run --ghc "$required_ghc" --cabal "$required_cabal" -- cabal update
-ghcup run --ghc "$required_ghc" --cabal "$required_cabal" -- scripts/desktop/build-lib-mac.sh
+ghcup run --ghc "$required_ghc" -- cabal update
+ghcup run --ghc "$required_ghc" -- scripts/desktop/build-lib-mac.sh
 
 upstream_arch="$(uname -m)"
 [[ "$upstream_arch" == "arm64" ]] && upstream_arch="aarch64"

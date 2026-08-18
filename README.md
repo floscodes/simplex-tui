@@ -20,8 +20,10 @@ cargo build --release
 ```
 
 Cargo's build script selects the native platform bootstrap, installs the
-required build packages, ghcup, GHC 9.6.3 and Cabal, then builds the pinned
-upstream library before compiling the Rust application. Linux package
+required build packages, ghcup, GHC 9.6.3 and Cabal when they are missing, then
+builds the pinned upstream library before compiling the Rust application. An
+existing Cabal installation is reused; its version does not have to match GHC's
+version. Linux package
 installation currently supports Debian/Ubuntu; macOS uses Homebrew; Windows
 uses the UCRT64 MSYS2 environment installed by GHCup. Rust/Cargo itself must
 already be installed (for example via rustup).
