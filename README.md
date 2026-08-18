@@ -35,6 +35,8 @@ can coexist with the project's regular compiler through ghcup.
 
 For Rust-only checks in an environment where `libsimplex` is intentionally not
 available, set `SIMPLEX_SKIP_BOOTSTRAP=1`.
+Once the native library exists, Cargo reuses it. Set
+`SIMPLEX_FORCE_BOOTSTRAP=1` to rebuild it explicitly.
 
 This checks out the recorded stable SimpleX Chat revision under
 `vendor/simplex-chat` and produces a self-contained library directory under
