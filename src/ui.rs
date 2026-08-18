@@ -38,6 +38,8 @@ impl Widget for &App {
         self.jump_to_latest_area.set(Rect::default());
         self.delete_cancel_area.set(Rect::default());
         self.delete_ok_area.set(Rect::default());
+        self.chat_deletion_close_area.set(Rect::default());
+        self.chat_deletion_change_area.set(Rect::default());
         self.message_hitboxes.borrow_mut().clear();
         self.reaction_option_areas.borrow_mut().clear();
         let columns = Layout::default()
@@ -54,6 +56,8 @@ impl Widget for &App {
         render_detail(self, columns[1], buf);
         if self.input_mode == InputMode::ConfirmDeleteProfile {
             render_delete_profile_confirmation(self, area, buf);
+        } else if self.chat_deletion_dialog.is_some() {
+            render_chat_deletion_dialog(self, area, buf);
         } else if self.reaction_picker.is_some() {
             render_reaction_picker(self, area, buf);
         }
@@ -242,6 +246,83 @@ fn render_delete_profile_confirmation(app: &App, area: Rect, buf: &mut Buffer) {
                 .border_style(Style::default().fg(Color::Red)),
         )
         .render(buttons[1], buf);
+}
+
+fn render_chat_deletion_dialog(app: &App, area: Rect, buf: &mut Buffer) {
+    let Some(dialog) = &app.chat_deletion_dialog else {
+        return;
+    };
+    let width = area.width.min(72);
+    let height = area.height.min(14);
+    let popup = Rect::new(
+        area.x + area.width.saturating_sub(width) / 2,
+        area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    );
+    let chat_name = app
+        .chats
+        .iter()
+        .find(|chat| chat.chat_ref == dialog.chat_ref)
+        .map_or("Chat", |chat| chat.display_name.as_str());
+    let status = if let Some(error) = &dialog.error {
+        format!("Could not update the setting:\n{error}")
+    } else if dialog.pending {
+        "Loading/updating…".into()
+    } else if let Some(settings) = &dialog.settings {
+        if settings.local_ttl == settings.disappearing_ttl {
+            format!("Current: {}", chat_delete_label(settings.local_ttl))
+        } else {
+            format!(
+                "Current: mixed\nLocal: {} · counterpart: {}",
+                chat_delete_label(settings.local_ttl),
+                chat_delete_label(settings.disappearing_ttl)
+            )
+        }
+    } else {
+        "Loading/updating…".into()
+    };
+    Clear.render(popup, buf);
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(format!(" Message deletion · {chat_name} "))
+        .padding(Padding::new(2, 2, 1, 1));
+    let inner = block.inner(popup);
+    block.render(popup, buf);
+    let rows = Layout::vertical([Constraint::Min(4), Constraint::Length(3)]).split(inner);
+    Paragraph::new(format!(
+        "{status}\n\nThis combines local deletion with SimpleX disappearing messages for this conversation."
+    ))
+    .wrap(Wrap { trim: false })
+    .render(rows[0], buf);
+    let buttons =
+        Layout::horizontal([Constraint::Percentage(38), Constraint::Percentage(62)]).split(rows[1]);
+    app.chat_deletion_close_area.set(buttons[0]);
+    app.chat_deletion_change_area.set(buttons[1]);
+    Paragraph::new("Close (Esc)")
+        .alignment(Alignment::Center)
+        .block(Block::bordered().border_type(BorderType::Rounded))
+        .render(buttons[0], buf);
+    Paragraph::new("Change (Enter/Space)")
+        .alignment(Alignment::Center)
+        .block(
+            Block::bordered()
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(Color::Cyan)),
+        )
+        .render(buttons[1], buf);
+}
+
+fn chat_delete_label(seconds: Option<i64>) -> &'static str {
+    match seconds {
+        None => "Profile default",
+        Some(0) => "Off",
+        Some(86_400) => "After 1 day",
+        Some(604_800) => "After 7 days",
+        Some(2_592_000) => "After 30 days",
+        Some(_) => "Custom",
+    }
 }
 
 fn render_chat(app: &App, area: Rect, buf: &mut Buffer) {
@@ -452,7 +533,7 @@ fn render_chat(app: &App, area: Rect, buf: &mut Buffer) {
     .render(symbol_area, buf);
 
     if let Some(footer) = rows.last() {
-        Paragraph::new("Enter: send · Shift+Enter: newline · PgUp/PgDn: scroll · End: latest")
+        Paragraph::new("Enter: send · Shift+Enter: newline · s: deletion · PgUp/PgDn: scroll")
             .alignment(Alignment::Center)
             .fg(Color::DarkGray)
             .render(*footer, buf);
@@ -560,7 +641,13 @@ fn render_message_bubbles(
             let reaction_text = message
                 .reactions
                 .iter()
-                .map(|reaction| format!("{} {}", reaction.emoji, reaction.count))
+                .map(|reaction| {
+                    if reaction.count > 1 {
+                        format!("{} {}", reaction.emoji, reaction.count)
+                    } else {
+                        reaction.emoji.clone()
+                    }
+                })
                 .collect::<Vec<_>>()
                 .join("  ");
             let reaction_area = Rect::new(x, bubble_area.bottom(), width, 1);
@@ -724,8 +811,9 @@ fn render_settings(app: &App, area: Rect, buf: &mut Buffer) {
             enabled(app.preferences.notification_sound)
         ),
         2 => format!(
-            "Local database\nManaged by SimpleX\n\nAutomatic message deletion\n{}\n\nEnter/Space: cycle Off → 1 day → 7 days → 30 days",
-            auto_delete_label(app.auto_delete_seconds)
+            "Default for new contacts\n\nMessage deletion\n{}{}\n\nEnter/Space: cycle Off → 1 day → 7 days → 30 days\n\nThis combines local retention with SimpleX disappearing messages. The latter is negotiated with contacts; modified clients can still retain copies.\n\nIn a chat, press s for a chat-specific override.",
+            auto_delete_label(app.auto_delete_pending.unwrap_or(app.auto_delete_seconds)),
+            if app.auto_delete_pending.is_some() { " (updating…)" } else { "" }
         ),
         3 => format!(
             "Theme\n{}\n\nCompact messages\n{}\n\nEnter/Space: change theme · c: toggle compact mode",
@@ -733,8 +821,7 @@ fn render_settings(app: &App, area: Rect, buf: &mut Buffer) {
             enabled(app.preferences.compact_messages)
         ),
         4 => format!(
-            "Defaults for new contacts\n\nDisappearing messages  {}   [d]\nFull deletion          {}   [x]\nMessage reactions      {}   [r]\nVoice messages         {}   [v]\nFiles and media        {}   [f]\nAudio/video calls      Disabled (fixed)\n\nThese preferences are negotiated by SimpleX. Their protocol events are not displayed as chat messages.",
-            enabled(app.chat_features.disappearing_messages),
+            "Defaults for new contacts\n\nFull deletion          {}   [x]\nMessage reactions      {}   [r]\nVoice messages         {}   [v]\nFiles and media        {}   [f]\nAudio/video calls      Disabled (fixed)\n\nDisappearing messages are managed together with local deletion under Privacy & Security.",
             enabled(app.chat_features.full_deletion),
             enabled(app.chat_features.reactions),
             enabled(app.chat_features.voice_messages),

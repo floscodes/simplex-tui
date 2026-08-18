@@ -8,7 +8,10 @@ use std::{
 
 use crate::event::{AppEvent, Event, EventHandler};
 use crate::{
-    chat::{ChatFeatures, ChatRef, ChatSummary, Message, Profile, SimplexEvent, User},
+    chat::{
+        ChatDeletionSettings, ChatFeatures, ChatRef, ChatSummary, Message, Profile, SimplexEvent,
+        User,
+    },
     preferences::Preferences,
     simplex::SimplexApi,
     simplex_worker::{ChatFeature, SimplexCommand},
@@ -54,6 +57,14 @@ pub(crate) struct ReactionPicker {
     pub row: u16,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct ChatDeletionDialog {
+    pub chat_ref: ChatRef,
+    pub settings: Option<ChatDeletionSettings>,
+    pub pending: bool,
+    pub error: Option<String>,
+}
+
 /// All state owned by the user interface.
 #[derive(Debug)]
 pub struct App {
@@ -76,6 +87,7 @@ pub struct App {
     pub sending: bool,
     pub preferences: Preferences,
     pub auto_delete_seconds: i64,
+    pub auto_delete_pending: Option<i64>,
     pub smp_servers: Vec<String>,
     pub chat_features: ChatFeatures,
     pub invitation_link: Option<String>,
@@ -92,9 +104,12 @@ pub struct App {
     pub(crate) max_chat_scroll: Cell<usize>,
     pub(crate) delete_cancel_area: Cell<Rect>,
     pub(crate) delete_ok_area: Cell<Rect>,
+    pub(crate) chat_deletion_close_area: Cell<Rect>,
+    pub(crate) chat_deletion_change_area: Cell<Rect>,
     pub(crate) message_hitboxes: RefCell<Vec<MessageHitbox>>,
     pub(crate) reaction_picker: Option<ReactionPicker>,
     pub(crate) reaction_option_areas: RefCell<Vec<(Rect, String)>>,
+    pub(crate) chat_deletion_dialog: Option<ChatDeletionDialog>,
     pub events: EventHandler,
     message_cache: HashMap<ChatRef, Vec<Message>>,
     simplex_events: mpsc::Receiver<SimplexEvent>,
@@ -125,6 +140,7 @@ impl Default for App {
             sending: false,
             preferences: Preferences::default(),
             auto_delete_seconds: 0,
+            auto_delete_pending: None,
             smp_servers: Vec::new(),
             chat_features: ChatFeatures::default(),
             invitation_link: None,
@@ -140,9 +156,12 @@ impl Default for App {
             max_chat_scroll: Cell::new(0),
             delete_cancel_area: Cell::new(Rect::default()),
             delete_ok_area: Cell::new(Rect::default()),
+            chat_deletion_close_area: Cell::new(Rect::default()),
+            chat_deletion_change_area: Cell::new(Rect::default()),
             message_hitboxes: RefCell::new(Vec::new()),
             reaction_picker: None,
             reaction_option_areas: RefCell::new(Vec::new()),
+            chat_deletion_dialog: None,
             events: EventHandler::new(),
             message_cache: HashMap::new(),
             simplex_events,
@@ -246,6 +265,14 @@ impl App {
             }
             return Ok(());
         }
+        if self.chat_deletion_dialog.is_some() {
+            match key.code {
+                KeyCode::Esc => self.chat_deletion_dialog = None,
+                KeyCode::Enter | KeyCode::Char(' ') => self.cycle_chat_deletion(),
+                _ => {}
+            }
+            return Ok(());
+        }
         if self.composer_focused {
             match key.code {
                 KeyCode::Esc => self.composer_focused = false,
@@ -269,6 +296,11 @@ impl App {
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') => self.events.send(AppEvent::Quit),
             KeyCode::Char('n') if self.section == Section::Chats => self.show_invitation(),
+            KeyCode::Char('s')
+                if self.section == Section::Chats && self.selected_chat < self.chats.len() =>
+            {
+                self.open_chat_deletion()
+            }
             KeyCode::Char('r')
                 if self.section == Section::Chats && self.selected_chat == self.chats.len() =>
             {
@@ -305,14 +337,6 @@ impl App {
             {
                 self.preferences.compact_messages = !self.preferences.compact_messages;
                 self.save_preferences();
-            }
-            KeyCode::Char('d')
-                if self.section == Section::Settings && self.selected_setting == 4 =>
-            {
-                self.toggle_chat_feature(
-                    ChatFeature::DisappearingMessages,
-                    !self.chat_features.disappearing_messages,
-                )
             }
             KeyCode::Char('x')
                 if self.section == Section::Settings && self.selected_setting == 4 =>
@@ -364,6 +388,22 @@ impl App {
         let button_click = matches!(kind, MouseEventKind::Down(_));
         if button_click && !self.composer_area.get().contains((column, row).into()) {
             self.composer_focused = false;
+        }
+        if left_click && self.chat_deletion_dialog.is_some() {
+            if self
+                .chat_deletion_change_area
+                .get()
+                .contains((column, row).into())
+            {
+                self.cycle_chat_deletion();
+            } else if self
+                .chat_deletion_close_area
+                .get()
+                .contains((column, row).into())
+            {
+                self.chat_deletion_dialog = None;
+            }
+            return;
         }
         if left_click && self.reaction_picker.is_some() {
             let emoji = self
@@ -552,6 +592,7 @@ impl App {
                     self.messages.clear();
                     self.message_cache.clear();
                     self.loaded_chat = None;
+                    self.auto_delete_pending = None;
                     self.invitation_link = None;
                     self.invitation_error = None;
                     self.notice = Some("Profile activated".into());
@@ -571,6 +612,7 @@ impl App {
                     self.messages.clear();
                     self.message_cache.clear();
                     self.loaded_chat = None;
+                    self.auto_delete_pending = None;
                     self.invitation_link = None;
                     self.invitation_error = None;
                     self.notice = Some("Profile created".into());
@@ -586,6 +628,7 @@ impl App {
                     self.messages.clear();
                     self.message_cache.clear();
                     self.loaded_chat = None;
+                    self.auto_delete_pending = None;
                     self.selected_chat = 0;
                     self.startup = active_user
                         .map(StartupState::Ready)
@@ -597,7 +640,44 @@ impl App {
                     self.notice = Some(format!("Could not delete profile: {error}"));
                 }
                 SimplexEvent::SettingChanged(message) => self.notice = Some(message),
-                SimplexEvent::AutoDeleteLoaded(seconds) => self.auto_delete_seconds = seconds,
+                SimplexEvent::AutoDeleteLoaded(seconds) => {
+                    self.auto_delete_seconds = seconds;
+                    self.auto_delete_pending = None;
+                }
+                SimplexEvent::AutoDeleteChanged(seconds) => {
+                    self.auto_delete_seconds = seconds;
+                    self.auto_delete_pending = None;
+                    self.notice = Some("Automatic deletion updated".into());
+                }
+                SimplexEvent::AutoDeleteFailed(error) => {
+                    self.auto_delete_pending = None;
+                    self.notice = Some(format!("Could not update automatic deletion: {error}"));
+                }
+                SimplexEvent::ChatDeletionLoaded { chat_ref, settings } => {
+                    if let Some(dialog) = &mut self.chat_deletion_dialog
+                        && dialog.chat_ref == chat_ref
+                    {
+                        dialog.settings = Some(settings);
+                        dialog.pending = false;
+                        dialog.error = None;
+                    }
+                }
+                SimplexEvent::ChatDeletionChanged { chat_ref, settings } => {
+                    if let Some(dialog) = &mut self.chat_deletion_dialog
+                        && dialog.chat_ref == chat_ref
+                    {
+                        dialog.settings = Some(settings);
+                        dialog.pending = false;
+                        dialog.error = None;
+                        self.notice = Some("Chat deletion updated".into());
+                    }
+                }
+                SimplexEvent::ChatDeletionFailed(error) => {
+                    if let Some(dialog) = &mut self.chat_deletion_dialog {
+                        dialog.pending = false;
+                        dialog.error = Some(error);
+                    }
+                }
                 SimplexEvent::ServersLoaded(servers) => self.smp_servers = servers,
                 SimplexEvent::ChatFeaturesLoaded(features) => self.chat_features = features,
                 SimplexEvent::InvitationCreated(link) => {
@@ -909,6 +989,52 @@ impl App {
             .send(SimplexCommand::DeleteProfile(user_id));
     }
 
+    fn open_chat_deletion(&mut self) {
+        let Some(chat_ref) = self.selected_chat_ref().cloned() else {
+            return;
+        };
+        self.chat_deletion_dialog = Some(ChatDeletionDialog {
+            chat_ref: chat_ref.clone(),
+            settings: None,
+            pending: true,
+            error: None,
+        });
+        let _ = self
+            .simplex_commands
+            .send(SimplexCommand::LoadChatDeletion { chat_ref });
+    }
+
+    fn cycle_chat_deletion(&mut self) {
+        let Some(user_id) = self.active_user().map(|user| user.id) else {
+            return;
+        };
+        let Some(dialog) = &mut self.chat_deletion_dialog else {
+            return;
+        };
+        if dialog.pending || dialog.settings.is_none() {
+            return;
+        }
+        let settings = dialog.settings.as_ref().expect("checked above");
+        let current = (settings.local_ttl == settings.disappearing_ttl)
+            .then_some(settings.local_ttl)
+            .flatten();
+        let seconds = match current {
+            None => Some(0),
+            Some(0) => Some(86_400),
+            Some(86_400) => Some(604_800),
+            Some(604_800) => Some(2_592_000),
+            Some(2_592_000) => None,
+            Some(_) => Some(0),
+        };
+        dialog.pending = true;
+        dialog.error = None;
+        let _ = self.simplex_commands.send(SimplexCommand::SetChatDeletion {
+            user_id,
+            chat_ref: dialog.chat_ref.clone(),
+            seconds,
+        });
+    }
+
     fn activate_setting(&mut self) {
         match self.selected_setting {
             1 => {
@@ -919,20 +1045,30 @@ impl App {
                 }
             }
             2 => {
+                if self.auto_delete_pending.is_some() {
+                    self.notice = Some("Automatic deletion update is still pending".into());
+                    return;
+                }
                 let Some(user_id) = self.active_user().map(|user| user.id) else {
                     self.notice = Some("Create a profile first".into());
                     return;
                 };
-                self.auto_delete_seconds = match self.auto_delete_seconds {
+                let seconds = match self.auto_delete_seconds {
                     0 => 86_400,
                     86_400 => 604_800,
                     604_800 => 2_592_000,
                     _ => 0,
                 };
-                let _ = self.simplex_commands.send(SimplexCommand::SetAutoDelete {
-                    user_id,
-                    seconds: self.auto_delete_seconds,
-                });
+                if self
+                    .simplex_commands
+                    .send(SimplexCommand::SetAutoDelete { user_id, seconds })
+                    .is_ok()
+                {
+                    self.auto_delete_pending = Some(seconds);
+                    self.notice = Some("Updating automatic deletion…".into());
+                } else {
+                    self.notice = Some("SimpleX worker is not available".into());
+                }
             }
             3 => {
                 self.preferences.theme = self.preferences.theme.next();
@@ -1365,5 +1501,95 @@ mod tests {
             panic!("expected delete-profile command")
         };
         assert_eq!(user_id, 9);
+    }
+
+    #[tokio::test]
+    async fn automatic_deletion_changes_only_after_core_confirmation() {
+        let (commands, receiver) = mpsc::channel();
+        let (event_sender, event_receiver) = mpsc::channel();
+        let mut app = App {
+            section: Section::Settings,
+            selected_setting: 2,
+            startup: StartupState::Ready(User {
+                id: 3,
+                display_name: "alice".into(),
+                notifications: true,
+                active: true,
+            }),
+            simplex_commands: commands,
+            simplex_events: event_receiver,
+            ..App::default()
+        };
+
+        app.activate_setting();
+        assert_eq!(app.auto_delete_seconds, 0);
+        assert_eq!(app.auto_delete_pending, Some(86_400));
+        let SimplexCommand::SetAutoDelete { user_id, seconds } = receiver.try_recv().unwrap()
+        else {
+            panic!("expected auto-delete command")
+        };
+        assert_eq!((user_id, seconds), (3, 86_400));
+
+        event_sender
+            .send(SimplexEvent::AutoDeleteChanged(86_400))
+            .unwrap();
+        app.tick();
+        assert_eq!(app.auto_delete_seconds, 86_400);
+        assert_eq!(app.auto_delete_pending, None);
+    }
+
+    #[tokio::test]
+    async fn chat_deletion_uses_a_combined_per_chat_override() {
+        let (commands, receiver) = mpsc::channel();
+        let (event_sender, event_receiver) = mpsc::channel();
+        let chat_ref = ChatRef("@7".into());
+        let mut app = App {
+            section: Section::Chats,
+            chats: vec![ChatSummary {
+                chat_ref: chat_ref.clone(),
+                display_name: "bob".into(),
+                unread_count: 0,
+            }],
+            startup: StartupState::Ready(User {
+                id: 3,
+                display_name: "alice".into(),
+                notifications: true,
+                active: true,
+            }),
+            simplex_commands: commands,
+            simplex_events: event_receiver,
+            ..App::default()
+        };
+
+        app.handle_key_events(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE))
+            .unwrap();
+        let SimplexCommand::LoadChatDeletion { chat_ref: loaded } = receiver.try_recv().unwrap()
+        else {
+            panic!("expected chat-deletion load command")
+        };
+        assert_eq!(loaded, chat_ref);
+
+        event_sender
+            .send(SimplexEvent::ChatDeletionLoaded {
+                chat_ref: chat_ref.clone(),
+                settings: ChatDeletionSettings::default(),
+            })
+            .unwrap();
+        app.tick();
+        app.handle_key_events(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        let (user_id, changed, seconds) = loop {
+            match receiver.try_recv().unwrap() {
+                SimplexCommand::SetChatDeletion {
+                    user_id,
+                    chat_ref,
+                    seconds,
+                } => break (user_id, chat_ref, seconds),
+                SimplexCommand::LoadChat(_) => {}
+                command => panic!("unexpected command: {command:?}"),
+            }
+        };
+        assert_eq!((user_id, changed, seconds), (3, chat_ref, Some(0)));
+        assert!(app.chat_deletion_dialog.as_ref().unwrap().pending);
     }
 }

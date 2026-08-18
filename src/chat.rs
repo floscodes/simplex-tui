@@ -45,6 +45,12 @@ pub struct ChatFeatures {
     pub files_and_media: bool,
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ChatDeletionSettings {
+    pub local_ttl: Option<i64>,
+    pub disappearing_ttl: Option<i64>,
+}
+
 #[derive(Clone, Debug)]
 pub enum SimplexEvent {
     Ready {
@@ -69,6 +75,17 @@ pub enum SimplexEvent {
     ProfileDeleteFailed(String),
     SettingChanged(String),
     AutoDeleteLoaded(i64),
+    AutoDeleteChanged(i64),
+    AutoDeleteFailed(String),
+    ChatDeletionLoaded {
+        chat_ref: ChatRef,
+        settings: ChatDeletionSettings,
+    },
+    ChatDeletionChanged {
+        chat_ref: ChatRef,
+        settings: ChatDeletionSettings,
+    },
+    ChatDeletionFailed(String),
     ServersLoaded(Vec<String>),
     ChatFeaturesLoaded(ChatFeatures),
     InvitationCreated(String),

@@ -32,6 +32,14 @@ pub enum SimplexCommand {
         user_id: i64,
         seconds: i64,
     },
+    LoadChatDeletion {
+        chat_ref: ChatRef,
+    },
+    SetChatDeletion {
+        user_id: i64,
+        chat_ref: ChatRef,
+        seconds: Option<i64>,
+    },
     CreateInvitation {
         user_id: i64,
     },
@@ -44,7 +52,6 @@ pub enum SimplexCommand {
 
 #[derive(Clone, Copy, Debug)]
 pub enum ChatFeature {
-    DisappearingMessages,
     FullDeletion,
     Reactions,
     VoiceMessages,
@@ -257,14 +264,36 @@ fn command_loop(
                         .map_err(|e| e.to_string())?;
                 }
                 SimplexCommand::SetAutoDelete { user_id, seconds } => {
-                    let response = controller
-                        .command(&format!("/_ttl {user_id} {seconds}"))
-                        .map_err(|e| e.to_string())?;
-                    ensure_ok(&response, "automatic deletion")?;
+                    let result = update_global_deletion(&controller, user_id, seconds);
                     sender
-                        .send(SimplexEvent::SettingChanged(
-                            "Automatic deletion updated".into(),
-                        ))
+                        .send(match result {
+                            Ok(seconds) => SimplexEvent::AutoDeleteChanged(seconds),
+                            Err(error) => SimplexEvent::AutoDeleteFailed(error),
+                        })
+                        .map_err(|e| e.to_string())?;
+                }
+                SimplexCommand::LoadChatDeletion { chat_ref } => {
+                    let result = load_chat_deletion(&controller, &chat_ref);
+                    sender
+                        .send(match result {
+                            Ok(settings) => SimplexEvent::ChatDeletionLoaded { chat_ref, settings },
+                            Err(error) => SimplexEvent::ChatDeletionFailed(error),
+                        })
+                        .map_err(|e| e.to_string())?;
+                }
+                SimplexCommand::SetChatDeletion {
+                    user_id,
+                    chat_ref,
+                    seconds,
+                } => {
+                    let result = update_chat_deletion(&controller, user_id, &chat_ref, seconds);
+                    sender
+                        .send(match result {
+                            Ok(settings) => {
+                                SimplexEvent::ChatDeletionChanged { chat_ref, settings }
+                            }
+                            Err(error) => SimplexEvent::ChatDeletionFailed(error),
+                        })
                         .map_err(|e| e.to_string())?;
                 }
                 SimplexCommand::CreateInvitation { user_id } => {
@@ -411,7 +440,6 @@ fn update_chat_feature(
     let response = controller.command("/profile").map_err(|e| e.to_string())?;
     let (mut profile, _) = chat::profile_and_features(&response)?;
     let name = match feature {
-        ChatFeature::DisappearingMessages => "timedMessages",
         ChatFeature::FullDeletion => "fullDelete",
         ChatFeature::Reactions => "reactions",
         ChatFeature::VoiceMessages => "voice",
@@ -422,6 +450,175 @@ fn update_chat_feature(
     update_profile(controller, user_id, &profile)?;
     let synthetic = serde_json::json!({"result": {"type": "userProfile", "profile": profile}});
     chat::profile_and_features(&synthetic).map(|(_, features)| features)
+}
+
+fn update_global_deletion(
+    controller: &crate::simplex::SimplexController,
+    user_id: i64,
+    seconds: i64,
+) -> Result<i64, String> {
+    let response = controller.command("/profile").map_err(|e| e.to_string())?;
+    let (mut profile, _) = chat::profile_and_features(&response)?;
+    set_timed_preference(&mut profile, Some(seconds))?;
+    set_profile_preference(&mut profile, "calls", false)?;
+    update_profile(controller, user_id, &profile)?;
+    let response = controller
+        .command(&format!("/_ttl {user_id} {seconds}"))
+        .map_err(|e| e.to_string())?;
+    ensure_ok(&response, "automatic deletion")?;
+    Ok(seconds)
+}
+
+fn load_chat_deletion(
+    controller: &crate::simplex::SimplexController,
+    chat_ref: &ChatRef,
+) -> Result<chat::ChatDeletionSettings, String> {
+    let response = controller
+        .command(&format!("/_get chat {} count=1", chat_ref.0))
+        .map_err(|e| e.to_string())?;
+    let info = response
+        .pointer("/result/chat/chatInfo")
+        .ok_or("chat response has no chatInfo")?;
+    let (entity, timed_pointer) = match info.get("type").and_then(serde_json::Value::as_str) {
+        Some("direct") => (
+            info.get("contact").ok_or("direct chat has no contact")?,
+            "/userPreferences/timedMessages",
+        ),
+        Some("group") => (
+            info.get("groupInfo").ok_or("group chat has no groupInfo")?,
+            "/groupProfile/groupPreferences/timedMessages",
+        ),
+        _ => return Err("chat deletion settings are unsupported for this chat type".into()),
+    };
+    let local_ttl = entity
+        .get("chatItemTTL")
+        .and_then(serde_json::Value::as_i64);
+    let timed = entity.pointer(timed_pointer);
+    let enabled = timed
+        .and_then(|value| value.get("allow").or_else(|| value.get("enable")))
+        .and_then(serde_json::Value::as_str);
+    let disappearing_ttl = match enabled {
+        Some("no" | "off") => Some(0),
+        Some("yes" | "always" | "on") => timed
+            .and_then(|value| value.get("ttl"))
+            .and_then(serde_json::Value::as_i64)
+            .or(Some(0)),
+        _ => None,
+    };
+    Ok(chat::ChatDeletionSettings {
+        local_ttl,
+        disappearing_ttl,
+    })
+}
+
+fn update_chat_deletion(
+    controller: &crate::simplex::SimplexController,
+    user_id: i64,
+    chat_ref: &ChatRef,
+    seconds: Option<i64>,
+) -> Result<chat::ChatDeletionSettings, String> {
+    let response = controller
+        .command(&format!("/_get chat {} count=1", chat_ref.0))
+        .map_err(|e| e.to_string())?;
+    let info = response
+        .pointer("/result/chat/chatInfo")
+        .ok_or("chat response has no chatInfo")?;
+    match info.get("type").and_then(serde_json::Value::as_str) {
+        Some("direct") => {
+            let mut preferences = info
+                .pointer("/contact/userPreferences")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!({}));
+            set_timed_preference(&mut preferences, seconds)?;
+            let response = controller
+                .command(&format!("/_set prefs {} {preferences}", chat_ref.0))
+                .map_err(|e| e.to_string())?;
+            ensure_ok(&response, "contact disappearing messages")?;
+        }
+        Some("group") => {
+            let mut profile = info
+                .pointer("/groupInfo/groupProfile")
+                .cloned()
+                .ok_or("group chat has no group profile")?;
+            set_group_timed_preference(&mut profile, seconds)?;
+            let response = controller
+                .command(&format!("/_group_profile {} {profile}", chat_ref.0))
+                .map_err(|e| e.to_string())?;
+            ensure_ok(&response, "group disappearing messages")?;
+        }
+        _ => return Err("chat deletion settings are unsupported for this chat type".into()),
+    }
+    let ttl = seconds.map_or_else(|| "default".to_owned(), |value| value.to_string());
+    let response = controller
+        .command(&format!("/_ttl {user_id} {} {ttl}", chat_ref.0))
+        .map_err(|e| e.to_string())?;
+    ensure_ok(&response, "local chat deletion")?;
+    load_chat_deletion(controller, chat_ref)
+}
+
+fn set_timed_preference(
+    object: &mut serde_json::Value,
+    seconds: Option<i64>,
+) -> Result<(), String> {
+    let is_profile = object.get("displayName").is_some();
+    let preferences = if is_profile {
+        object
+            .as_object_mut()
+            .ok_or("profile is not an object")?
+            .entry("preferences")
+            .or_insert_with(|| serde_json::json!({}))
+    } else {
+        object
+    };
+    let preferences = preferences
+        .as_object_mut()
+        .ok_or("preferences are not an object")?;
+    match seconds {
+        None => {
+            preferences.remove("timedMessages");
+        }
+        Some(seconds) => {
+            preferences.insert(
+                "timedMessages".into(),
+                if seconds == 0 {
+                    serde_json::json!({"allow": "no"})
+                } else {
+                    serde_json::json!({"allow": "yes", "ttl": seconds})
+                },
+            );
+        }
+    }
+    Ok(())
+}
+
+fn set_group_timed_preference(
+    profile: &mut serde_json::Value,
+    seconds: Option<i64>,
+) -> Result<(), String> {
+    let profile = profile
+        .as_object_mut()
+        .ok_or("group profile is not an object")?;
+    let preferences = profile
+        .entry("groupPreferences")
+        .or_insert_with(|| serde_json::json!({}))
+        .as_object_mut()
+        .ok_or("group preferences are not an object")?;
+    match seconds {
+        None => {
+            preferences.remove("timedMessages");
+        }
+        Some(seconds) => {
+            preferences.insert(
+                "timedMessages".into(),
+                if seconds == 0 {
+                    serde_json::json!({"enable": "off"})
+                } else {
+                    serde_json::json!({"enable": "on", "ttl": seconds})
+                },
+            );
+        }
+    }
+    Ok(())
 }
 
 fn preference_allow<'a>(profile: &'a serde_json::Value, name: &str) -> Option<&'a str> {
