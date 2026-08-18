@@ -8,7 +8,7 @@ use std::{
 };
 
 use crate::{
-    chat::{self, ChatRef, SimplexEvent},
+    chat::{self, ChatRef, ServerProtocol, SimplexEvent},
     simplex::{SimplexApi, SimplexPaths},
 };
 
@@ -54,6 +54,17 @@ pub enum SimplexCommand {
         user_id: i64,
         feature: ChatFeature,
         enabled: bool,
+    },
+    SetServerEnabled {
+        user_id: i64,
+        protocol: ServerProtocol,
+        address: String,
+        enabled: bool,
+    },
+    AddServer {
+        user_id: i64,
+        protocol: ServerProtocol,
+        address: String,
     },
 }
 
@@ -368,6 +379,36 @@ fn command_loop(
                             )))
                             .map_err(|e| e.to_string())?,
                     }
+                }
+                SimplexCommand::SetServerEnabled {
+                    user_id,
+                    protocol,
+                    address,
+                    enabled,
+                } => {
+                    let result =
+                        set_server_enabled(&controller, user_id, protocol, &address, enabled)
+                            .and_then(|()| load_servers(&controller, user_id));
+                    sender
+                        .send(match result {
+                            Ok(servers) => SimplexEvent::ServersLoaded(servers),
+                            Err(error) => SimplexEvent::ServersUpdateFailed(error),
+                        })
+                        .map_err(|e| e.to_string())?;
+                }
+                SimplexCommand::AddServer {
+                    user_id,
+                    protocol,
+                    address,
+                } => {
+                    let result = add_server(&controller, user_id, protocol, &address)
+                        .and_then(|()| load_servers(&controller, user_id));
+                    sender
+                        .send(match result {
+                            Ok(servers) => SimplexEvent::ServersLoaded(servers),
+                            Err(error) => SimplexEvent::ServersUpdateFailed(error),
+                        })
+                        .map_err(|e| e.to_string())?;
                 }
             }
         }
@@ -795,13 +836,128 @@ fn send_servers(
     sender: &Sender<SimplexEvent>,
     user_id: i64,
 ) -> Result<(), String> {
-    let response = controller
-        .command(&format!("/_servers {user_id}"))
-        .map_err(|e| e.to_string())?;
-    let servers = chat::smp_servers(&response)?;
+    let servers = load_servers(controller, user_id)?;
     sender
         .send(SimplexEvent::ServersLoaded(servers))
         .map_err(|e| e.to_string())
+}
+
+fn load_servers(
+    controller: &crate::simplex::SimplexController,
+    user_id: i64,
+) -> Result<Vec<chat::ServerEntry>, String> {
+    let response = controller
+        .command(&format!("/_servers {user_id}"))
+        .map_err(|e| e.to_string())?;
+    chat::server_entries(&response)
+}
+
+fn user_servers_json(
+    controller: &crate::simplex::SimplexController,
+    user_id: i64,
+) -> Result<serde_json::Value, String> {
+    let response = controller
+        .command(&format!("/_servers {user_id}"))
+        .map_err(|e| e.to_string())?;
+    response
+        .pointer("/result/userServers")
+        .cloned()
+        .ok_or_else(|| format!("user server response is invalid: {response}"))
+}
+
+fn save_user_servers(
+    controller: &crate::simplex::SimplexController,
+    user_id: i64,
+    servers: &serde_json::Value,
+) -> Result<(), String> {
+    let response = controller
+        .command(&format!("/_servers {user_id} {servers}"))
+        .map_err(|e| e.to_string())?;
+    ensure_ok(&response, "server configuration")
+}
+
+fn set_server_enabled(
+    controller: &crate::simplex::SimplexController,
+    user_id: i64,
+    protocol: ServerProtocol,
+    address: &str,
+    enabled: bool,
+) -> Result<(), String> {
+    let mut groups = user_servers_json(controller, user_id)?;
+    let mut found = false;
+    for group in groups
+        .as_array_mut()
+        .ok_or("user servers are not an array")?
+    {
+        for server in group
+            .get_mut(protocol.json_key())
+            .and_then(serde_json::Value::as_array_mut)
+            .into_iter()
+            .flatten()
+        {
+            if server.get("server").and_then(serde_json::Value::as_str) == Some(address) {
+                server
+                    .as_object_mut()
+                    .ok_or("server entry is not an object")?
+                    .insert("enabled".into(), enabled.into());
+                found = true;
+            }
+        }
+    }
+    if !found {
+        return Err("server is no longer present".into());
+    }
+    save_user_servers(controller, user_id, &groups)
+}
+
+fn add_server(
+    controller: &crate::simplex::SimplexController,
+    user_id: i64,
+    protocol: ServerProtocol,
+    address: &str,
+) -> Result<(), String> {
+    if !address.starts_with(match protocol {
+        ServerProtocol::Smp => "smp://",
+        ServerProtocol::Xftp => "xftp://",
+    }) {
+        return Err(format!(
+            "expected an {}:// server address",
+            protocol.label().to_ascii_lowercase()
+        ));
+    }
+    let mut groups_json = user_servers_json(controller, user_id)?;
+    let groups = groups_json
+        .as_array_mut()
+        .ok_or("user servers are not an array")?;
+    if groups.iter().any(|group| {
+        group
+            .get(protocol.json_key())
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|servers| {
+                servers.iter().any(|server| {
+                    server.get("server").and_then(serde_json::Value::as_str) == Some(address)
+                })
+            })
+    }) {
+        return Err("server is already configured".into());
+    }
+    let custom_group = groups
+        .iter_mut()
+        .find(|group| group.get("operator").is_none_or(serde_json::Value::is_null))
+        .ok_or("custom server group is missing")?;
+    custom_group
+        .get_mut(protocol.json_key())
+        .and_then(serde_json::Value::as_array_mut)
+        .ok_or("custom server list is missing")?
+        .push(serde_json::json!({
+            "server": address,
+            "preset": false,
+            "tested": null,
+            "enabled": true,
+            "roles": {"storage": null, "proxy": null, "names": null},
+            "deleted": false
+        }));
+    save_user_servers(controller, user_id, &groups_json)
 }
 
 fn load_profiles(
@@ -822,7 +978,12 @@ fn load_chats(
 }
 
 fn ensure_ok(value: &serde_json::Value, operation: &str) -> Result<(), String> {
-    if value.get("error").is_some() {
+    if value.get("error").is_some()
+        || value
+            .pointer("/result/type")
+            .and_then(serde_json::Value::as_str)
+            == Some("chatCmdError")
+    {
         Err(format!("failed to update {operation}: {value}"))
     } else {
         Ok(())

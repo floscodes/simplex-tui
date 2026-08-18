@@ -917,18 +917,39 @@ fn render_settings(app: &App, area: Rect, buf: &mut Buffer) {
             enabled(app.chat_features.files_and_media),
         ),
         5 => {
-            let servers = if app.smp_servers.is_empty() {
-                "No SMP servers loaded.".into()
+            if app.input_mode == InputMode::AddServer {
+                format!(
+                    "Add {} server\n\nServer address\n{}▏\n\nEnter: save · Esc: cancel\n\nExpected format: {}://fingerprint@host",
+                    app.server_protocol.label(),
+                    app.input,
+                    app.server_protocol.label().to_ascii_lowercase()
+                )
             } else {
-                app.smp_servers
+                let servers = app.visible_servers();
+                let list = if servers.is_empty() {
+                    "  No servers configured".into()
+                } else {
+                    servers
                     .iter()
-                    .map(|server| server.split('@').nth(1).unwrap_or(server).replace(',', "\n    onion: "))
+                    .enumerate()
+                    .map(|(index, server)| {
+                        format!(
+                            "{} [{}] {}{}",
+                            if index == app.selected_server { ">" } else { " " },
+                            if server.enabled { "on " } else { "off" },
+                            server.address,
+                            if server.preset { "  (standard)" } else { "  (custom)" }
+                        )
+                    })
                     .collect::<Vec<_>>()
-                    .join("\n\n")
-            };
-            format!(
-                "Servers configured for the active profile\n\n{servers}\n\nNew profiles use the official SimpleX preset. Invitations use this profile-specific server configuration."
-            )
+                    .join("\n")
+                };
+                format!(
+                    "Protocol: {}   [p: switch SMP/XFTP]   [a: add custom server]\n\n{}\n\nj/k: select · Enter/Space: enable or disable\n\nStandard and custom servers are stored by SimpleX for the active profile.",
+                    app.server_protocol.label(),
+                    list
+                )
+            }
         }
         _ => "simplex-tui\nA private terminal client powered by the official SimpleX Chat library.\n\nSimpleX data and application state are stored under ~/.simplex-tui.".into(),
     };

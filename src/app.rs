@@ -9,8 +9,8 @@ use std::{
 use crate::event::{AppEvent, Event, EventHandler};
 use crate::{
     chat::{
-        ChatDeletionSettings, ChatFeatures, ChatRef, ChatSummary, Message, Profile, SimplexEvent,
-        User,
+        ChatDeletionSettings, ChatFeatures, ChatRef, ChatSummary, Message, Profile, ServerEntry,
+        ServerProtocol, SimplexEvent, User,
     },
     preferences::Preferences,
     simplex::SimplexApi,
@@ -41,6 +41,7 @@ pub enum InputMode {
     None,
     CreateProfile,
     ConfirmDeleteProfile,
+    AddServer,
 }
 
 #[derive(Clone, Debug)]
@@ -94,7 +95,9 @@ pub struct App {
     pub preferences: Preferences,
     pub auto_delete_seconds: i64,
     pub auto_delete_pending: Option<i64>,
-    pub smp_servers: Vec<String>,
+    pub servers: Vec<ServerEntry>,
+    pub server_protocol: ServerProtocol,
+    pub selected_server: usize,
     pub chat_features: ChatFeatures,
     pub invitation_link: Option<String>,
     pub invitation_loading: bool,
@@ -150,7 +153,9 @@ impl Default for App {
             preferences: Preferences::default(),
             auto_delete_seconds: 0,
             auto_delete_pending: None,
-            smp_servers: Vec::new(),
+            servers: Vec::new(),
+            server_protocol: ServerProtocol::Smp,
+            selected_server: 0,
             chat_features: ChatFeatures::default(),
             invitation_link: None,
             invitation_loading: false,
@@ -189,7 +194,7 @@ impl App {
         "Privacy & Security",
         "Appearance",
         "Chat Features",
-        "SMP Servers",
+        "Servers",
         "About",
     ];
 
@@ -287,6 +292,23 @@ impl App {
             }
             return Ok(());
         }
+        if self.input_mode == InputMode::AddServer {
+            match key.code {
+                KeyCode::Esc => {
+                    self.input_mode = InputMode::None;
+                    self.input.clear();
+                }
+                KeyCode::Enter if !self.input.trim().is_empty() => self.add_server(),
+                KeyCode::Backspace => {
+                    self.input.pop();
+                }
+                KeyCode::Char(character) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.input.push(character)
+                }
+                _ => {}
+            }
+            return Ok(());
+        }
         if self.chat_deletion_dialog.is_some() {
             match key.code {
                 KeyCode::Esc => self.chat_deletion_dialog = None,
@@ -352,7 +374,39 @@ impl App {
                 self.input_mode = InputMode::ConfirmDeleteProfile;
             }
             KeyCode::Enter | KeyCode::Char(' ') if self.section == Section::Settings => {
-                self.activate_setting()
+                if self.selected_setting == 5 {
+                    self.toggle_selected_server();
+                } else {
+                    self.activate_setting()
+                }
+            }
+            KeyCode::Char('a')
+                if self.section == Section::Settings && self.selected_setting == 5 =>
+            {
+                self.input_mode = InputMode::AddServer;
+                self.input.clear();
+            }
+            KeyCode::Char('p')
+                if self.section == Section::Settings && self.selected_setting == 5 =>
+            {
+                self.server_protocol = match self.server_protocol {
+                    ServerProtocol::Smp => ServerProtocol::Xftp,
+                    ServerProtocol::Xftp => ServerProtocol::Smp,
+                };
+                self.selected_server = 0;
+            }
+            KeyCode::Char('k')
+                if self.section == Section::Settings && self.selected_setting == 5 =>
+            {
+                self.selected_server = self.selected_server.saturating_sub(1);
+            }
+            KeyCode::Char('j')
+                if self.section == Section::Settings && self.selected_setting == 5 =>
+            {
+                self.selected_server = self
+                    .selected_server
+                    .saturating_add(1)
+                    .min(self.visible_servers().len().saturating_sub(1));
             }
             KeyCode::Char('c')
                 if self.section == Section::Settings && self.selected_setting == 3 =>
@@ -764,7 +818,15 @@ impl App {
                         replace_message(messages, message);
                     }
                 }
-                SimplexEvent::ServersLoaded(servers) => self.smp_servers = servers,
+                SimplexEvent::ServersLoaded(servers) => {
+                    self.servers = servers;
+                    self.selected_server = self
+                        .selected_server
+                        .min(self.visible_servers().len().saturating_sub(1));
+                }
+                SimplexEvent::ServersUpdateFailed(error) => {
+                    self.notice = Some(format!("Could not update servers: {error}"));
+                }
                 SimplexEvent::ChatFeaturesLoaded(features) => self.chat_features = features,
                 SimplexEvent::InvitationCreated(link) => {
                     self.invitation_link = Some(link);
@@ -1039,6 +1101,52 @@ impl App {
             user_id,
             feature,
             enabled,
+        });
+    }
+
+    pub fn visible_servers(&self) -> Vec<&ServerEntry> {
+        self.servers
+            .iter()
+            .filter(|server| server.protocol == self.server_protocol)
+            .collect()
+    }
+
+    fn toggle_selected_server(&mut self) {
+        let Some(user_id) = self.active_user().map(|user| user.id) else {
+            self.notice = Some("Create a profile first".into());
+            return;
+        };
+        let Some(server) = self.visible_servers().get(self.selected_server).copied() else {
+            self.notice = Some("Add a server first".into());
+            return;
+        };
+        let protocol = server.protocol;
+        let address = server.address.clone();
+        let enabled = !server.enabled;
+        self.notice = Some("Updating server configuration…".into());
+        let _ = self
+            .simplex_commands
+            .send(SimplexCommand::SetServerEnabled {
+                user_id,
+                protocol,
+                address,
+                enabled,
+            });
+    }
+
+    fn add_server(&mut self) {
+        let Some(user_id) = self.active_user().map(|user| user.id) else {
+            self.notice = Some("Create a profile first".into());
+            return;
+        };
+        let address = self.input.trim().to_owned();
+        self.input_mode = InputMode::None;
+        self.input.clear();
+        self.notice = Some(format!("Adding {} server…", self.server_protocol.label()));
+        let _ = self.simplex_commands.send(SimplexCommand::AddServer {
+            user_id,
+            protocol: self.server_protocol,
+            address,
         });
     }
 
@@ -1786,5 +1894,63 @@ mod tests {
             panic!("expected cancel-file command")
         };
         assert_eq!(file_id, 41);
+    }
+
+    #[tokio::test]
+    async fn server_settings_toggle_and_add_both_protocols() {
+        let (commands, receiver) = mpsc::channel();
+        let mut app = App {
+            section: Section::Settings,
+            selected_setting: 5,
+            startup: StartupState::Ready(User {
+                id: 3,
+                display_name: "alice".into(),
+                notifications: true,
+                active: true,
+            }),
+            servers: vec![ServerEntry {
+                protocol: ServerProtocol::Smp,
+                address: "smp://key@smp.example".into(),
+                enabled: true,
+                preset: true,
+            }],
+            simplex_commands: commands,
+            ..App::default()
+        };
+
+        app.handle_key_events(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        let SimplexCommand::SetServerEnabled {
+            user_id,
+            protocol,
+            address,
+            enabled,
+        } = receiver.try_recv().unwrap()
+        else {
+            panic!("expected server-toggle command")
+        };
+        assert_eq!(user_id, 3);
+        assert_eq!(protocol, ServerProtocol::Smp);
+        assert_eq!(address, "smp://key@smp.example");
+        assert!(!enabled);
+
+        app.handle_key_events(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(app.server_protocol, ServerProtocol::Xftp);
+        app.handle_key_events(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE))
+            .unwrap();
+        app.input = "xftp://key@files.example".into();
+        app.handle_key_events(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        let SimplexCommand::AddServer {
+            user_id,
+            protocol,
+            address,
+        } = receiver.try_recv().unwrap()
+        else {
+            panic!("expected add-server command")
+        };
+        assert_eq!((user_id, protocol), (3, ServerProtocol::Xftp));
+        assert_eq!(address, "xftp://key@files.example");
     }
 }

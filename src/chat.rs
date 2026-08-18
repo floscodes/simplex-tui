@@ -10,6 +10,36 @@ pub struct User {
 
 pub type Profile = User;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ServerProtocol {
+    Smp,
+    Xftp,
+}
+
+impl ServerProtocol {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Smp => "SMP",
+            Self::Xftp => "XFTP",
+        }
+    }
+
+    pub fn json_key(self) -> &'static str {
+        match self {
+            Self::Smp => "smpServers",
+            Self::Xftp => "xftpServers",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ServerEntry {
+    pub protocol: ServerProtocol,
+    pub address: String,
+    pub enabled: bool,
+    pub preset: bool,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ChatSummary {
     pub chat_ref: ChatRef,
@@ -121,7 +151,8 @@ pub enum SimplexEvent {
         chat_ref: ChatRef,
         message: Message,
     },
-    ServersLoaded(Vec<String>),
+    ServersLoaded(Vec<ServerEntry>),
+    ServersUpdateFailed(String),
     ChatFeaturesLoaded(ChatFeatures),
     InvitationCreated(String),
     InvitationFailed(String),
@@ -193,6 +224,48 @@ pub fn smp_servers(value: &Value) -> Result<Vec<String>, String> {
     servers.sort();
     servers.dedup();
     Ok(servers)
+}
+
+pub fn server_entries(value: &Value) -> Result<Vec<ServerEntry>, String> {
+    let groups = value
+        .pointer("/result/userServers")
+        .and_then(Value::as_array)
+        .ok_or_else(|| response_error(value, "user servers"))?;
+    let mut entries = Vec::new();
+    for group in groups {
+        for protocol in [ServerProtocol::Smp, ServerProtocol::Xftp] {
+            for server in group
+                .get(protocol.json_key())
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                let Some(address) = server.get("server").and_then(Value::as_str) else {
+                    continue;
+                };
+                if server
+                    .get("deleted")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+                {
+                    continue;
+                }
+                entries.push(ServerEntry {
+                    protocol,
+                    address: address.to_owned(),
+                    enabled: server
+                        .get("enabled")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(true),
+                    preset: server
+                        .get("preset")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
+                });
+            }
+        }
+    }
+    Ok(entries)
 }
 
 pub fn profile_and_features(value: &Value) -> Result<(Value, ChatFeatures), String> {
@@ -723,6 +796,46 @@ mod tests {
         assert_eq!(
             servers,
             vec!["smp://fingerprint@smp11.simplex.im,onion".to_owned()]
+        );
+    }
+
+    #[test]
+    fn parses_smp_and_xftp_server_configuration() {
+        let servers = server_entries(&json!({"result": {
+            "type": "userServers",
+            "userServers": [{
+                "operator": {"tradeName": "SimpleX Chat"},
+                "smpServers": [{
+                    "server": "smp://key@smp.example",
+                    "enabled": true,
+                    "preset": true,
+                    "deleted": false
+                }],
+                "xftpServers": [{
+                    "server": "xftp://key@xftp.example",
+                    "enabled": false,
+                    "preset": true,
+                    "deleted": false
+                }]
+            }]
+        }}))
+        .unwrap();
+        assert_eq!(
+            servers,
+            vec![
+                ServerEntry {
+                    protocol: ServerProtocol::Smp,
+                    address: "smp://key@smp.example".into(),
+                    enabled: true,
+                    preset: true,
+                },
+                ServerEntry {
+                    protocol: ServerProtocol::Xftp,
+                    address: "xftp://key@xftp.example".into(),
+                    enabled: false,
+                    preset: true,
+                },
+            ]
         );
     }
 
