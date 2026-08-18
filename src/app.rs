@@ -1765,6 +1765,7 @@ mod tests {
                     size: 100,
                     kind: crate::chat::AttachmentKind::File,
                     status: "rcvTransfer".into(),
+                    progress: Some(50),
                     path: None,
                 }),
             }],

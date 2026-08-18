@@ -45,6 +45,7 @@ pub struct Attachment {
     pub size: i64,
     pub kind: AttachmentKind,
     pub status: String,
+    pub progress: Option<u8>,
     pub path: Option<String>,
 }
 
@@ -534,6 +535,21 @@ fn parse_attachment(file: &Value, content_type: Option<&str>) -> Option<Attachme
             .and_then(Value::as_str)
             .unwrap_or("unknown")
             .to_owned(),
+        progress: file
+            .pointer("/fileStatus/rcvProgress")
+            .and_then(Value::as_i64)
+            .zip(file.pointer("/fileStatus/rcvTotal").and_then(Value::as_i64))
+            .and_then(|(progress, total)| {
+                (total > 0).then(|| {
+                    u8::try_from(
+                        progress
+                            .saturating_mul(100)
+                            .saturating_div(total)
+                            .clamp(0, 100),
+                    )
+                    .unwrap_or(100)
+                })
+            }),
         path: file
             .pointer("/fileSource/filePath")
             .and_then(Value::as_str)
@@ -552,11 +568,27 @@ fn attachment_kind_from_name(name: &str) -> AttachmentKind {
 }
 
 pub fn file_update(value: &Value) -> Option<(ChatRef, Message)> {
-    let item = value.pointer("/result/chatItem")?;
-    Some((
-        chat_ref(item.get("chatInfo")?).ok()?,
-        parse_message(item.get("chatItem")?)?,
-    ))
+    let result = value.get("result")?;
+    let item = result.get("chatItem").or_else(|| result.get("chatItem_"))?;
+    let mut message = parse_message(item.get("chatItem")?)?;
+    if let Some(attachment) = &mut message.attachment
+        && let Some((received, total)) = result
+            .get("receivedSize")
+            .and_then(Value::as_i64)
+            .zip(result.get("totalSize").and_then(Value::as_i64))
+        && total > 0
+    {
+        attachment.progress = Some(
+            u8::try_from(
+                received
+                    .saturating_mul(100)
+                    .saturating_div(total)
+                    .clamp(0, 100),
+            )
+            .unwrap_or(100),
+        );
+    }
+    Some((chat_ref(item.get("chatInfo")?).ok()?, message))
 }
 
 fn response_error(value: &Value, expected: &str) -> String {
@@ -773,8 +805,10 @@ mod tests {
         assert_eq!(attachment.status, "rcvInvitation");
 
         let update = json!({"result": {
-            "type": "rcvFileComplete",
-            "chatItem": {
+            "type": "rcvFileProgressXFTP",
+            "receivedSize": 25,
+            "totalSize": 100,
+            "chatItem_": {
                 "chatInfo": {"type": "direct", "contact": {"contactId": 7}},
                 "chatItem": chat_item
             }
@@ -782,5 +816,6 @@ mod tests {
         let (chat_ref, updated) = file_update(&update).unwrap();
         assert_eq!(chat_ref, ChatRef("@7".into()));
         assert_eq!(updated.id, 33);
+        assert_eq!(updated.attachment.unwrap().progress, Some(25));
     }
 }

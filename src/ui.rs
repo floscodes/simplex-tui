@@ -725,12 +725,16 @@ fn message_display_text(message: &Message) -> String {
         AttachmentKind::Video => "🎞️",
     };
     let action = if message.outgoing {
-        ""
+        String::new()
     } else {
         match attachment.status.as_str() {
-            "rcvAccepted" | "rcvTransfer" => "  …  ⏹ Stop",
-            "rcvComplete" => "  ✓",
-            _ => "  ↓",
+            "rcvAccepted" => "  ○  ⏹ Stop".into(),
+            "rcvTransfer" => format!(
+                "  {}  ⏹ Stop",
+                circular_progress(attachment.progress.unwrap_or(0))
+            ),
+            "rcvComplete" => "  ✓".into(),
+            _ => "  ↓".into(),
         }
     };
     let file = format!("{icon}  {}{action}", attachment.name);
@@ -738,6 +742,16 @@ fn message_display_text(message: &Message) -> String {
         file
     } else {
         format!("{}\n{file}", message.text)
+    }
+}
+
+fn circular_progress(percent: u8) -> char {
+    match percent {
+        0..=12 => '○',
+        13..=37 => '◔',
+        38..=62 => '◑',
+        63..=87 => '◕',
+        _ => '●',
     }
 }
 
