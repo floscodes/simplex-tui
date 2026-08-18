@@ -27,6 +27,25 @@ pub struct Message {
     pub timestamp: String,
     pub outgoing: bool,
     pub reactions: Vec<MessageReaction>,
+    pub attachment: Option<Attachment>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AttachmentKind {
+    File,
+    Audio,
+    Image,
+    Video,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Attachment {
+    pub id: i64,
+    pub name: String,
+    pub size: i64,
+    pub kind: AttachmentKind,
+    pub status: String,
+    pub path: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -86,6 +105,21 @@ pub enum SimplexEvent {
         settings: ChatDeletionSettings,
     },
     ChatDeletionFailed(String),
+    FileDownloadStarted {
+        file_id: i64,
+        path: String,
+    },
+    FileDownloadFailed {
+        file_id: i64,
+        error: String,
+    },
+    FileDownloadCancelled {
+        file_id: i64,
+    },
+    FileUpdated {
+        chat_ref: ChatRef,
+        message: Message,
+    },
     ServersLoaded(Vec<String>),
     ChatFeaturesLoaded(ChatFeatures),
     InvitationCreated(String),
@@ -435,8 +469,18 @@ fn parse_message(item: &Value) -> Option<Message> {
         return None;
     }
     let meta = item.get("meta")?;
-    let text = meta.get("itemText")?.as_str()?.to_owned();
-    if text.is_empty() {
+    let text = meta
+        .get("itemText")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_owned();
+    let message_kind = item
+        .pointer("/content/msgContent/type")
+        .and_then(Value::as_str);
+    let attachment = item
+        .get("file")
+        .and_then(|file| parse_attachment(file, message_kind));
+    if text.is_empty() && attachment.is_none() {
         return None;
     }
     let direction = item
@@ -468,7 +512,51 @@ fn parse_message(item: &Value) -> Option<Message> {
                 })
             })
             .collect(),
+        attachment,
     })
+}
+
+fn parse_attachment(file: &Value, content_type: Option<&str>) -> Option<Attachment> {
+    let name = file.get("fileName")?.as_str()?.to_owned();
+    let kind = match content_type {
+        Some("image") => AttachmentKind::Image,
+        Some("video") => AttachmentKind::Video,
+        Some("voice") => AttachmentKind::Audio,
+        _ => attachment_kind_from_name(&name),
+    };
+    Some(Attachment {
+        id: file.get("fileId")?.as_i64()?,
+        name,
+        size: file.get("fileSize").and_then(Value::as_i64).unwrap_or(0),
+        kind,
+        status: file
+            .pointer("/fileStatus/type")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown")
+            .to_owned(),
+        path: file
+            .pointer("/fileSource/filePath")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+    })
+}
+
+fn attachment_kind_from_name(name: &str) -> AttachmentKind {
+    let extension = name.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
+    match extension.as_str() {
+        "jpg" | "jpeg" | "png" | "gif" | "webp" | "bmp" | "svg" | "heic" => AttachmentKind::Image,
+        "mp3" | "m4a" | "aac" | "wav" | "ogg" | "opus" | "flac" => AttachmentKind::Audio,
+        "mp4" | "m4v" | "mkv" | "mov" | "webm" | "avi" => AttachmentKind::Video,
+        _ => AttachmentKind::File,
+    }
+}
+
+pub fn file_update(value: &Value) -> Option<(ChatRef, Message)> {
+    let item = value.pointer("/result/chatItem")?;
+    Some((
+        chat_ref(item.get("chatInfo")?).ok()?,
+        parse_message(item.get("chatItem")?)?,
+    ))
 }
 
 fn response_error(value: &Value, expected: &str) -> String {
@@ -658,5 +746,41 @@ mod tests {
             update,
             Some((ChatRef("@7".into()), 22, "😂".into(), true, false))
         );
+    }
+
+    #[test]
+    fn parses_file_only_messages_and_file_updates() {
+        let chat_item = json!({
+            "chatDir": {"type": "directRcv"},
+            "content": {
+                "type": "rcvMsgContent",
+                "msgContent": {"type": "image", "text": "", "image": "preview"}
+            },
+            "meta": {"itemId": 33, "itemText": ""},
+            "reactions": [],
+            "file": {
+                "fileId": 44,
+                "fileName": "photo.png",
+                "fileSize": 1234,
+                "fileStatus": {"type": "rcvInvitation"},
+                "fileProtocol": "xftp"
+            }
+        });
+        let message = parse_message(&chat_item).unwrap();
+        let attachment = message.attachment.unwrap();
+        assert_eq!(attachment.kind, AttachmentKind::Image);
+        assert_eq!(attachment.name, "photo.png");
+        assert_eq!(attachment.status, "rcvInvitation");
+
+        let update = json!({"result": {
+            "type": "rcvFileComplete",
+            "chatItem": {
+                "chatInfo": {"type": "direct", "contact": {"contactId": 7}},
+                "chatItem": chat_item
+            }
+        }});
+        let (chat_ref, updated) = file_update(&update).unwrap();
+        assert_eq!(chat_ref, ChatRef("@7".into()));
+        assert_eq!(updated.id, 33);
     }
 }

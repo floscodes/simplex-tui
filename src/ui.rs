@@ -9,8 +9,10 @@ use ratatui::{
     },
 };
 use tui_qrcode::{Colors, QrCodeWidget, Scaling};
+use unicode_width::UnicodeWidthStr;
 
 use crate::app::{App, InputMode, Section, StartupState};
+use crate::chat::{AttachmentKind, Message};
 use crate::preferences::Theme;
 
 const REACTION_EMOJIS: [&str; 8] = ["👍", "👎", "😀", "😂", "😢", "❤", "🚀", "✅"];
@@ -40,6 +42,8 @@ impl Widget for &App {
         self.delete_ok_area.set(Rect::default());
         self.chat_deletion_close_area.set(Rect::default());
         self.chat_deletion_change_area.set(Rect::default());
+        self.download_cancel_no_area.set(Rect::default());
+        self.download_cancel_yes_area.set(Rect::default());
         self.message_hitboxes.borrow_mut().clear();
         self.reaction_option_areas.borrow_mut().clear();
         let columns = Layout::default()
@@ -54,7 +58,9 @@ impl Widget for &App {
         render_tabs(self, sidebar[0], buf);
         render_sidebar(self, sidebar[1], buf);
         render_detail(self, columns[1], buf);
-        if self.input_mode == InputMode::ConfirmDeleteProfile {
+        if self.download_cancel_dialog.is_some() {
+            render_download_cancel_confirmation(self, area, buf);
+        } else if self.input_mode == InputMode::ConfirmDeleteProfile {
             render_delete_profile_confirmation(self, area, buf);
         } else if self.chat_deletion_dialog.is_some() {
             render_chat_deletion_dialog(self, area, buf);
@@ -248,6 +254,52 @@ fn render_delete_profile_confirmation(app: &App, area: Rect, buf: &mut Buffer) {
         .render(buttons[1], buf);
 }
 
+fn render_download_cancel_confirmation(app: &App, area: Rect, buf: &mut Buffer) {
+    let Some(dialog) = &app.download_cancel_dialog else {
+        return;
+    };
+    let width = area.width.min(60);
+    let height = area.height.min(9);
+    let popup = Rect::new(
+        area.x + area.width.saturating_sub(width) / 2,
+        area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    );
+    Clear.render(popup, buf);
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(Color::Yellow))
+        .title(" Cancel download? ");
+    let inner = block.inner(popup);
+    block.render(popup, buf);
+    let rows = Layout::vertical([Constraint::Min(2), Constraint::Length(3)]).split(inner);
+    Paragraph::new(format!("Cancel download of {}?", dialog.file_name))
+        .alignment(Alignment::Center)
+        .wrap(Wrap { trim: false })
+        .render(rows[0], buf);
+    let buttons =
+        Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).split(rows[1]);
+    app.download_cancel_no_area.set(buttons[0]);
+    app.download_cancel_yes_area.set(buttons[1]);
+    Paragraph::new("No (Enter)")
+        .alignment(Alignment::Center)
+        .block(
+            Block::bordered()
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(Color::Cyan)),
+        )
+        .render(buttons[0], buf);
+    Paragraph::new("Yes (y)")
+        .alignment(Alignment::Center)
+        .block(
+            Block::bordered()
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(Color::Yellow)),
+        )
+        .render(buttons[1], buf);
+}
+
 fn render_chat_deletion_dialog(app: &App, area: Rect, buf: &mut Buffer) {
     let Some(dialog) = &app.chat_deletion_dialog else {
         return;
@@ -380,7 +432,7 @@ fn render_chat(app: &App, area: Rect, buf: &mut Buffer) {
             let time = message.timestamp.get(11..16).unwrap_or("");
             let prefix = if message.outgoing { "You" } else { chat };
             bubble_size(
-                &message.text,
+                &message_display_text(message),
                 prefix,
                 time,
                 rows[1].width,
@@ -549,19 +601,15 @@ fn bubble_size(
 ) -> (u16, u16) {
     let available_width = area_width.saturating_sub(1).max(1);
     let max_width = available_width.saturating_mul(3).div_ceil(4).max(1);
-    let title_width = sender.chars().count() + time.chars().count() + 5;
-    let longest_line = text
-        .lines()
-        .map(|line| line.chars().count())
-        .max()
-        .unwrap_or(1);
+    let title_width = UnicodeWidthStr::width(sender) + UnicodeWidthStr::width(time) + 5;
+    let longest_line = text.lines().map(UnicodeWidthStr::width).max().unwrap_or(1);
     let desired = u16::try_from(longest_line.max(title_width).saturating_add(4))
         .unwrap_or(max_width)
         .clamp(12.min(available_width), max_width.min(available_width));
     let content_width = usize::from(desired.saturating_sub(4).max(1));
     let content_height = text
         .split('\n')
-        .map(|line| line.chars().count().max(1).div_ceil(content_width))
+        .map(|line| UnicodeWidthStr::width(line).max(1).div_ceil(content_width))
         .sum::<usize>()
         .max(1);
     let height = u16::try_from(
@@ -627,7 +675,7 @@ fn render_message_bubbles(
                 format!(" {sender} · {time} "),
                 Style::default().fg(color).add_modifier(Modifier::BOLD),
             )));
-        Paragraph::new(message.text.as_str())
+        Paragraph::new(message_display_text(message))
             .block(bubble)
             .wrap(Wrap { trim: false })
             .render(bubble_area, buf);
@@ -663,6 +711,33 @@ fn render_message_bubbles(
         y = y
             .saturating_add(height)
             .saturating_add(u16::try_from(gap).unwrap_or(0));
+    }
+}
+
+fn message_display_text(message: &Message) -> String {
+    let Some(attachment) = &message.attachment else {
+        return message.text.clone();
+    };
+    let icon = match attachment.kind {
+        AttachmentKind::File => "📄",
+        AttachmentKind::Audio => "🔊",
+        AttachmentKind::Image => "🖼️",
+        AttachmentKind::Video => "🎞️",
+    };
+    let action = if message.outgoing {
+        ""
+    } else {
+        match attachment.status.as_str() {
+            "rcvAccepted" | "rcvTransfer" => "  …  ⏹ Stop",
+            "rcvComplete" => "  ✓",
+            _ => "  ↓",
+        }
+    };
+    let file = format!("{icon}  {}{action}", attachment.name);
+    if message.text.trim().is_empty() || message.text == attachment.name {
+        file
+    } else {
+        format!("{}\n{file}", message.text)
     }
 }
 

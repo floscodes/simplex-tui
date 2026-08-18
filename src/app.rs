@@ -65,6 +65,12 @@ pub(crate) struct ChatDeletionDialog {
     pub error: Option<String>,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct DownloadCancelDialog {
+    pub file_id: i64,
+    pub file_name: String,
+}
+
 /// All state owned by the user interface.
 #[derive(Debug)]
 pub struct App {
@@ -110,6 +116,9 @@ pub struct App {
     pub(crate) reaction_picker: Option<ReactionPicker>,
     pub(crate) reaction_option_areas: RefCell<Vec<(Rect, String)>>,
     pub(crate) chat_deletion_dialog: Option<ChatDeletionDialog>,
+    pub(crate) download_cancel_dialog: Option<DownloadCancelDialog>,
+    pub(crate) download_cancel_no_area: Cell<Rect>,
+    pub(crate) download_cancel_yes_area: Cell<Rect>,
     pub events: EventHandler,
     message_cache: HashMap<ChatRef, Vec<Message>>,
     simplex_events: mpsc::Receiver<SimplexEvent>,
@@ -162,6 +171,9 @@ impl Default for App {
             reaction_picker: None,
             reaction_option_areas: RefCell::new(Vec::new()),
             chat_deletion_dialog: None,
+            download_cancel_dialog: None,
+            download_cancel_no_area: Cell::new(Rect::default()),
+            download_cancel_yes_area: Cell::new(Rect::default()),
             events: EventHandler::new(),
             message_cache: HashMap::new(),
             simplex_events,
@@ -225,6 +237,16 @@ impl App {
     pub fn handle_key_events(&mut self, key: KeyEvent) -> color_eyre::Result<()> {
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
             self.events.send(AppEvent::Quit);
+            return Ok(());
+        }
+        if self.download_cancel_dialog.is_some() {
+            match key.code {
+                KeyCode::Char('y') => self.confirm_cancel_download(),
+                KeyCode::Enter | KeyCode::Esc | KeyCode::Char('n') => {
+                    self.download_cancel_dialog = None
+                }
+                _ => {}
+            }
             return Ok(());
         }
         if self.input_mode == InputMode::ConfirmDeleteProfile {
@@ -389,6 +411,22 @@ impl App {
         if button_click && !self.composer_area.get().contains((column, row).into()) {
             self.composer_focused = false;
         }
+        if left_click && self.download_cancel_dialog.is_some() {
+            if self
+                .download_cancel_yes_area
+                .get()
+                .contains((column, row).into())
+            {
+                self.confirm_cancel_download();
+            } else if self
+                .download_cancel_no_area
+                .get()
+                .contains((column, row).into())
+            {
+                self.download_cancel_dialog = None;
+            }
+            return;
+        }
         if left_click && self.chat_deletion_dialog.is_some() {
             if self
                 .chat_deletion_change_area
@@ -446,6 +484,20 @@ impl App {
                 self.input_mode = InputMode::None;
             }
             return;
+        }
+        if left_click {
+            let item_id = self
+                .message_hitboxes
+                .borrow()
+                .iter()
+                .rev()
+                .find(|hitbox| hitbox.area.contains((column, row).into()))
+                .map(|hitbox| hitbox.item_id);
+            if let Some(item_id) = item_id
+                && self.download_attachment(item_id)
+            {
+                return;
+            }
         }
         if left_click {
             if self
@@ -676,6 +728,40 @@ impl App {
                     if let Some(dialog) = &mut self.chat_deletion_dialog {
                         dialog.pending = false;
                         dialog.error = Some(error);
+                    }
+                }
+                SimplexEvent::FileDownloadStarted { file_id, path } => {
+                    update_attachment_status(
+                        &mut self.messages,
+                        file_id,
+                        "rcvTransfer",
+                        Some(path.as_str()),
+                    );
+                    for messages in self.message_cache.values_mut() {
+                        update_attachment_status(messages, file_id, "rcvTransfer", Some(&path));
+                    }
+                    self.notice = Some(format!("Downloading to {path}"));
+                }
+                SimplexEvent::FileDownloadFailed { file_id, error } => {
+                    update_attachment_status(&mut self.messages, file_id, "rcvError", None);
+                    for messages in self.message_cache.values_mut() {
+                        update_attachment_status(messages, file_id, "rcvError", None);
+                    }
+                    self.notice = Some(format!("Could not download file: {error}"));
+                }
+                SimplexEvent::FileDownloadCancelled { file_id } => {
+                    update_attachment_status(&mut self.messages, file_id, "rcvCancelled", None);
+                    for messages in self.message_cache.values_mut() {
+                        update_attachment_status(messages, file_id, "rcvCancelled", None);
+                    }
+                    self.notice = Some("Download cancelled".into());
+                }
+                SimplexEvent::FileUpdated { chat_ref, message } => {
+                    if self.loaded_chat.as_ref() == Some(&chat_ref) {
+                        replace_message(&mut self.messages, message.clone());
+                    }
+                    if let Some(messages) = self.message_cache.get_mut(&chat_ref) {
+                        replace_message(messages, message);
                     }
                 }
                 SimplexEvent::ServersLoaded(servers) => self.smp_servers = servers,
@@ -1004,6 +1090,48 @@ impl App {
             .send(SimplexCommand::LoadChatDeletion { chat_ref });
     }
 
+    fn download_attachment(&mut self, item_id: i64) -> bool {
+        let Some(message) = self.messages.iter().find(|message| message.id == item_id) else {
+            return false;
+        };
+        if message.outgoing {
+            return false;
+        }
+        let Some(attachment) = message.attachment.as_ref() else {
+            return false;
+        };
+        if attachment.status == "rcvComplete" {
+            self.notice = attachment
+                .path
+                .as_ref()
+                .map(|path| format!("File saved to {path}"));
+            return true;
+        }
+        if matches!(attachment.status.as_str(), "rcvAccepted" | "rcvTransfer") {
+            self.download_cancel_dialog = Some(DownloadCancelDialog {
+                file_id: attachment.id,
+                file_name: attachment.name.clone(),
+            });
+            return true;
+        }
+        let _ = self.simplex_commands.send(SimplexCommand::ReceiveFile {
+            file_id: attachment.id,
+            file_name: attachment.name.clone(),
+        });
+        self.notice = Some("Starting file download…".into());
+        true
+    }
+
+    fn confirm_cancel_download(&mut self) {
+        let Some(dialog) = self.download_cancel_dialog.take() else {
+            return;
+        };
+        let _ = self.simplex_commands.send(SimplexCommand::CancelFile {
+            file_id: dialog.file_id,
+        });
+        self.notice = Some(format!("Cancelling download of {}…", dialog.file_name));
+    }
+
     fn cycle_chat_deletion(&mut self) {
         let Some(user_id) = self.active_user().map(|user| user.id) else {
             return;
@@ -1155,6 +1283,30 @@ fn update_message_reaction(
     message.reactions.retain(|reaction| reaction.count > 0);
 }
 
+fn update_attachment_status(
+    messages: &mut [Message],
+    file_id: i64,
+    status: &str,
+    path: Option<&str>,
+) {
+    if let Some(attachment) = messages
+        .iter_mut()
+        .filter_map(|message| message.attachment.as_mut())
+        .find(|attachment| attachment.id == file_id)
+    {
+        attachment.status = status.into();
+        if let Some(path) = path {
+            attachment.path = Some(path.into());
+        }
+    }
+}
+
+fn replace_message(messages: &mut [Message], updated: Message) {
+    if let Some(message) = messages.iter_mut().find(|message| message.id == updated.id) {
+        *message = updated;
+    }
+}
+
 fn ring_terminal_bell() {
     let mut stdout = io::stdout();
     let _ = stdout.write_all(b"\x07");
@@ -1299,6 +1451,7 @@ mod tests {
                     timestamp: String::new(),
                     outgoing: false,
                     reactions: Vec::new(),
+                    attachment: None,
                 },
             })
             .unwrap();
@@ -1344,6 +1497,7 @@ mod tests {
                     timestamp: String::new(),
                     outgoing: true,
                     reactions: Vec::new(),
+                    attachment: None,
                 },
             })
             .unwrap();
@@ -1378,6 +1532,7 @@ mod tests {
                     timestamp: String::new(),
                     outgoing: true,
                     reactions: Vec::new(),
+                    attachment: None,
                 },
             })
             .unwrap();
@@ -1439,6 +1594,7 @@ mod tests {
             timestamp: String::new(),
             outgoing: false,
             reactions: Vec::new(),
+            attachment: None,
         };
         event_sender
             .send(SimplexEvent::MessageReceived {
@@ -1591,5 +1747,43 @@ mod tests {
         };
         assert_eq!((user_id, changed, seconds), (3, chat_ref, Some(0)));
         assert!(app.chat_deletion_dialog.as_ref().unwrap().pending);
+    }
+
+    #[tokio::test]
+    async fn download_cancel_defaults_to_no_and_requires_confirmation() {
+        let (commands, receiver) = mpsc::channel();
+        let mut app = App {
+            messages: vec![Message {
+                id: 8,
+                text: String::new(),
+                timestamp: String::new(),
+                outgoing: false,
+                reactions: Vec::new(),
+                attachment: Some(crate::chat::Attachment {
+                    id: 41,
+                    name: "archive.zip".into(),
+                    size: 100,
+                    kind: crate::chat::AttachmentKind::File,
+                    status: "rcvTransfer".into(),
+                    path: None,
+                }),
+            }],
+            simplex_commands: commands,
+            ..App::default()
+        };
+
+        assert!(app.download_attachment(8));
+        app.handle_key_events(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        assert!(app.download_cancel_dialog.is_none());
+        assert!(receiver.try_recv().is_err());
+
+        assert!(app.download_attachment(8));
+        app.handle_key_events(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))
+            .unwrap();
+        let SimplexCommand::CancelFile { file_id } = receiver.try_recv().unwrap() else {
+            panic!("expected cancel-file command")
+        };
+        assert_eq!(file_id, 41);
     }
 }

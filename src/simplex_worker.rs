@@ -25,6 +25,13 @@ pub enum SimplexCommand {
         item_id: i64,
         emoji: String,
     },
+    ReceiveFile {
+        file_id: i64,
+        file_name: String,
+    },
+    CancelFile {
+        file_id: i64,
+    },
     ActivateProfile(i64),
     CreateProfile(String),
     DeleteProfile(i64),
@@ -205,6 +212,41 @@ fn command_loop(
                         .map_err(|e| e.to_string())?;
                     send_reaction_change(sender, &response)?;
                 }
+                SimplexCommand::ReceiveFile { file_id, file_name } => {
+                    match receive_file(&controller, file_id, &file_name) {
+                        Ok((path, response)) => {
+                            sender
+                                .send(SimplexEvent::FileDownloadStarted {
+                                    file_id,
+                                    path: path.to_string_lossy().into_owned(),
+                                })
+                                .map_err(|e| e.to_string())?;
+                            if let Some((chat_ref, message)) = chat::file_update(&response) {
+                                sender
+                                    .send(SimplexEvent::FileUpdated { chat_ref, message })
+                                    .map_err(|e| e.to_string())?;
+                            }
+                        }
+                        Err(error) => sender
+                            .send(SimplexEvent::FileDownloadFailed { file_id, error })
+                            .map_err(|e| e.to_string())?,
+                    }
+                }
+                SimplexCommand::CancelFile { file_id } => match cancel_file(&controller, file_id) {
+                    Ok(response) => {
+                        sender
+                            .send(SimplexEvent::FileDownloadCancelled { file_id })
+                            .map_err(|e| e.to_string())?;
+                        if let Some((chat_ref, message)) = chat::file_update(&response) {
+                            sender
+                                .send(SimplexEvent::FileUpdated { chat_ref, message })
+                                .map_err(|e| e.to_string())?;
+                        }
+                    }
+                    Err(error) => sender
+                        .send(SimplexEvent::FileDownloadFailed { file_id, error })
+                        .map_err(|e| e.to_string())?,
+                },
                 SimplexCommand::ActivateProfile(user_id) => {
                     let result = (|| {
                         let response = controller
@@ -334,6 +376,11 @@ fn command_loop(
             .map_err(|e| e.to_string())?
         {
             send_reaction_change(sender, &value)?;
+            if let Some((chat_ref, message)) = chat::file_update(&value) {
+                sender
+                    .send(SimplexEvent::FileUpdated { chat_ref, message })
+                    .map_err(|e| e.to_string())?;
+            }
             if let Some((user_id, chat_ref)) = chat::connected_contact(&value) {
                 let chats = load_chats(&controller, user_id)?;
                 sender
@@ -347,6 +394,80 @@ fn command_loop(
             }
         }
     }
+}
+
+fn receive_file(
+    controller: &crate::simplex::SimplexController,
+    file_id: i64,
+    file_name: &str,
+) -> Result<(std::path::PathBuf, serde_json::Value), String> {
+    let user_dirs = directories::UserDirs::new().ok_or("could not locate user directories")?;
+    let directory = user_dirs
+        .download_dir()
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_else(|| user_dirs.home_dir().join("Downloads"));
+    std::fs::create_dir_all(&directory)
+        .map_err(|error| format!("could not create {}: {error}", directory.display()))?;
+    let safe_name = std::path::Path::new(file_name)
+        .file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .filter(|name| !name.is_empty() && *name != "." && *name != "..")
+        .unwrap_or("simplex-file");
+    let path = unused_download_path(&directory, safe_name);
+    let response = controller
+        .command(&format!(
+            "/freceive {file_id} approved_relays=on {}",
+            path.display()
+        ))
+        .map_err(|error| error.to_string())?;
+    if response
+        .pointer("/result/type")
+        .and_then(serde_json::Value::as_str)
+        != Some("rcvFileAccepted")
+    {
+        return Err(format!("file download was not accepted: {response}"));
+    }
+    Ok((path, response))
+}
+
+fn cancel_file(
+    controller: &crate::simplex::SimplexController,
+    file_id: i64,
+) -> Result<serde_json::Value, String> {
+    let response = controller
+        .command(&format!("/fcancel {file_id}"))
+        .map_err(|error| error.to_string())?;
+    if response
+        .pointer("/result/type")
+        .and_then(serde_json::Value::as_str)
+        != Some("rcvFileCancelled")
+    {
+        return Err(format!("file download was not cancelled: {response}"));
+    }
+    Ok(response)
+}
+
+fn unused_download_path(directory: &std::path::Path, name: &str) -> std::path::PathBuf {
+    let original = directory.join(name);
+    if !original.exists() {
+        return original;
+    }
+    let path = std::path::Path::new(name);
+    let stem = path
+        .file_stem()
+        .and_then(std::ffi::OsStr::to_str)
+        .unwrap_or("file");
+    let extension = path.extension().and_then(std::ffi::OsStr::to_str);
+    for number in 1.. {
+        let candidate = match extension {
+            Some(extension) => directory.join(format!("{stem} ({number}).{extension}")),
+            None => directory.join(format!("{stem} ({number})")),
+        };
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    unreachable!()
 }
 
 fn send_reaction_change(
