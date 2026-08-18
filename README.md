@@ -13,14 +13,23 @@ SimpleX clients. The Haskell `simplex-chat` package pins and builds
 [`simplexmq`](https://github.com/simplex-chat/simplexmq) itself, so no messaging
 protocol is reimplemented in Rust.
 
-Build the pinned upstream library on Linux with:
+On Debian/Ubuntu, build the complete application with:
 
 ```bash
-./scripts/bootstrap-simplex.sh
+cargo build --release
 ```
 
-The upstream Linux build currently requires GHC 9.6.3. It can coexist with the
-project's regular compiler through ghcup.
+Cargo's build script installs missing Linux build packages, ghcup, GHC 9.6.3
+and Cabal, then builds the pinned upstream library before compiling the Rust
+application. Rust/Cargo itself must already be installed (for example via
+rustup).
+
+To prepare only the native library, run `./scripts/bootstrap-simplex.sh`.
+The Haskell compiler can coexist with the project's regular compiler through
+ghcup.
+
+For Rust-only checks in an environment where `libsimplex` is intentionally not
+available, set `SIMPLEX_SKIP_BOOTSTRAP=1`.
 
 This checks out the recorded stable SimpleX Chat revision under
 `vendor/simplex-chat` and produces a self-contained library directory under
