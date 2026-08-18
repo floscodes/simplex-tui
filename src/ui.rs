@@ -180,9 +180,8 @@ fn render_profile(app: &App, area: Rect, buf: &mut Buffer) {
     }
     let profile = &app.profiles[app.selected_profile];
     Paragraph::new(format!(
-        "Display name\n{}\n\nNotifications\n{}\n\nStatus\n{}\n\nEnter: activate · n: new profile · d: delete",
+        "Display name\n{}\n\nStatus\n{}\n\nEnter: activate · n: new profile · d: delete",
         profile.display_name,
-        enabled(profile.notifications),
         if profile.active { "Active" } else { "Inactive" },
     ))
     .block(panel(&profile.display_name).padding(Padding::new(2, 2, 1, 1)))
@@ -634,9 +633,8 @@ fn render_settings(app: &App, area: Rect, buf: &mut Buffer) {
             app.profiles.len()
         ),
         1 => format!(
-            "Profile notifications\n{}\n\nMessage preview\n{}\n\nEnter/Space: toggle notifications · p: toggle preview",
-            app.active_user().map_or("Unavailable", |user| enabled(user.notifications)),
-            enabled(app.preferences.message_preview)
+            "Notification sound\n{}\n\nEnter/Space: toggle sound\n\nWhen enabled, incoming messages ring the terminal bell.",
+            enabled(app.preferences.notification_sound)
         ),
         2 => format!(
             "Local database\nManaged by SimpleX\n\nAutomatic message deletion\n{}\n\nEnter/Space: cycle Off → 1 day → 7 days → 30 days",

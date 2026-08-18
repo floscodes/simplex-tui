@@ -23,10 +23,6 @@ pub enum SimplexCommand {
     ActivateProfile(i64),
     CreateProfile(String),
     DeleteProfile(i64),
-    SetNotifications {
-        user_id: i64,
-        enabled: bool,
-    },
     SetAutoDelete {
         user_id: i64,
         seconds: i64,
@@ -242,19 +238,6 @@ fn command_loop(
                             },
                             Err(error) => SimplexEvent::ProfileDeleteFailed(error),
                         })
-                        .map_err(|e| e.to_string())?;
-                }
-                SimplexCommand::SetNotifications { user_id, enabled } => {
-                    let action = if enabled { "unmute" } else { "mute" };
-                    let response = controller
-                        .command(&format!("/_{action} user {user_id}"))
-                        .map_err(|e| e.to_string())?;
-                    ensure_ok(&response, "notifications")?;
-                    sender
-                        .send(SimplexEvent::SettingChanged(format!(
-                            "Notifications {}",
-                            if enabled { "enabled" } else { "disabled" }
-                        )))
                         .map_err(|e| e.to_string())?;
                 }
                 SimplexCommand::SetAutoDelete { user_id, seconds } => {

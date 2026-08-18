@@ -1,5 +1,10 @@
 use std::sync::Arc;
-use std::{cell::Cell, collections::HashMap, sync::mpsc};
+use std::{
+    cell::Cell,
+    collections::HashMap,
+    io::{self, Write},
+    sync::mpsc,
+};
 
 use crate::event::{AppEvent, Event, EventHandler};
 use crate::{
@@ -129,7 +134,7 @@ impl Default for App {
 impl App {
     pub const SETTINGS: [&'static str; 7] = [
         "General",
-        "Notifications",
+        "Sound",
         "Privacy & Security",
         "Appearance",
         "Chat Features",
@@ -275,12 +280,6 @@ impl App {
             KeyCode::Enter | KeyCode::Char(' ') if self.section == Section::Settings => {
                 self.activate_setting()
             }
-            KeyCode::Char('p')
-                if self.section == Section::Settings && self.selected_setting == 1 =>
-            {
-                self.preferences.message_preview = !self.preferences.message_preview;
-                self.save_preferences();
-            }
             KeyCode::Char('c')
                 if self.section == Section::Settings && self.selected_setting == 3 =>
             {
@@ -341,9 +340,11 @@ impl App {
     }
 
     fn handle_mouse_event(&mut self, kind: MouseEventKind, column: u16, row: u16) {
-        if self.input_mode == InputMode::ConfirmDeleteProfile
-            && matches!(kind, MouseEventKind::Down(MouseButton::Left))
-        {
+        let left_click = matches!(kind, MouseEventKind::Down(MouseButton::Left));
+        if left_click && !self.composer_area.get().contains((column, row).into()) {
+            self.composer_focused = false;
+        }
+        if self.input_mode == InputMode::ConfirmDeleteProfile && left_click {
             if self.delete_ok_area.get().contains((column, row).into()) {
                 self.confirm_delete_profile();
             } else if self.delete_cancel_area.get().contains((column, row).into()) {
@@ -351,7 +352,7 @@ impl App {
             }
             return;
         }
-        if matches!(kind, MouseEventKind::Down(MouseButton::Left)) {
+        if left_click {
             if self
                 .jump_to_latest_area
                 .get()
@@ -611,6 +612,9 @@ impl App {
                     if !is_new {
                         continue;
                     }
+                    if !message.outgoing && self.preferences.notification_sound {
+                        ring_terminal_bell();
+                    }
                     let chat_is_visible = self.section == Section::Chats
                         && self.selected_chat_ref() == Some(&chat_ref)
                         && self.loaded_chat.as_ref() == Some(&chat_ref)
@@ -821,23 +825,11 @@ impl App {
     fn activate_setting(&mut self) {
         match self.selected_setting {
             1 => {
-                let Some(user) = self.active_user().cloned() else {
-                    self.notice = Some("Create a profile first".into());
-                    return;
-                };
-                let enabled = !user.notifications;
-                if let StartupState::Ready(active) = &mut self.startup {
-                    active.notifications = enabled;
+                self.preferences.notification_sound = !self.preferences.notification_sound;
+                self.save_preferences();
+                if self.preferences.notification_sound {
+                    ring_terminal_bell();
                 }
-                if let Some(profile) = self.profiles.iter_mut().find(|p| p.id == user.id) {
-                    profile.notifications = enabled;
-                }
-                let _ = self
-                    .simplex_commands
-                    .send(SimplexCommand::SetNotifications {
-                        user_id: user.id,
-                        enabled,
-                    });
             }
             2 => {
                 let Some(user_id) = self.active_user().map(|user| user.id) else {
@@ -907,6 +899,12 @@ fn cache_message(cache: &mut HashMap<ChatRef, Vec<Message>>, chat_ref: &ChatRef,
     }
 }
 
+fn ring_terminal_bell() {
+    let mut stdout = io::stdout();
+    let _ = stdout.write_all(b"\x07");
+    let _ = stdout.flush();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -949,9 +947,12 @@ mod tests {
     async fn mouse_selects_tabs_and_the_exact_list_row() {
         let mut app = App::default();
         app.area.set(Rect::new(0, 0, 100, 30));
+        app.composer_area.set(Rect::new(35, 20, 50, 5));
+        app.composer_focused = true;
 
         app.handle_mouse_event(MouseEventKind::Down(MouseButton::Left), 12, 1);
         assert_eq!(app.section, Section::Profiles);
+        assert!(!app.composer_focused);
 
         app.handle_mouse_event(MouseEventKind::Down(MouseButton::Left), 23, 1);
         assert_eq!(app.section, Section::Settings);

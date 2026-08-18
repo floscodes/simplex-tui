@@ -33,7 +33,7 @@ impl Theme {
 pub struct Preferences {
     pub theme: Theme,
     pub compact_messages: bool,
-    pub message_preview: bool,
+    pub notification_sound: bool,
 }
 
 impl Preferences {
@@ -63,7 +63,7 @@ mod tests {
         let preferences = Preferences {
             theme: Theme::Dark,
             compact_messages: true,
-            message_preview: false,
+            notification_sound: true,
         };
         preferences.save(root.path()).unwrap();
         assert_eq!(Preferences::load(root.path()), preferences);
