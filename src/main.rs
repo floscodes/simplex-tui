@@ -15,12 +15,21 @@ pub mod simplex;
 pub mod simplex_worker;
 pub mod ui;
 
+#[cfg(target_os = "linux")]
+const SIMPLEX_LIBRARY_NAME: &str = "libsimplex.so";
+#[cfg(target_os = "macos")]
+const SIMPLEX_LIBRARY_NAME: &str = "libsimplex.dylib";
+#[cfg(target_os = "windows")]
+const SIMPLEX_LIBRARY_NAME: &str = "libsimplex.dll";
+
 fn main() -> color_eyre::Result<()> {
     color_eyre::install()?;
     let library_path = std::env::var_os("SIMPLEX_CHAT_LIB")
         .map(PathBuf::from)
         .unwrap_or_else(|| {
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("vendor/libsimplex/libsimplex.so")
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("vendor/libsimplex")
+                .join(SIMPLEX_LIBRARY_NAME)
         });
     // Initialize the GHC runtime on the process main thread, before Tokio
     // creates any worker threads. The bootstrap script pins the matching ABI.

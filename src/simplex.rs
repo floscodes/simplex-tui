@@ -110,7 +110,7 @@ pub struct SimplexApi {
 }
 
 impl SimplexApi {
-    /// Load `libsimplex.so` built by the official SimpleX desktop build script.
+    /// Load the native SimpleX library built by the official desktop build script.
     ///
     /// # Safety
     /// `path` must point to an ABI-compatible official SimpleX Chat library and

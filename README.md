@@ -13,20 +13,23 @@ SimpleX clients. The Haskell `simplex-chat` package pins and builds
 [`simplexmq`](https://github.com/simplex-chat/simplexmq) itself, so no messaging
 protocol is reimplemented in Rust.
 
-On Debian/Ubuntu, build the complete application with:
+On Linux, macOS or 64-bit Windows, build the complete application with:
 
 ```bash
 cargo build --release
 ```
 
-Cargo's build script installs missing Linux build packages, ghcup, GHC 9.6.3
-and Cabal, then builds the pinned upstream library before compiling the Rust
-application. Rust/Cargo itself must already be installed (for example via
-rustup).
+Cargo's build script selects the native platform bootstrap, installs the
+required build packages, ghcup, GHC 9.6.3 and Cabal, then builds the pinned
+upstream library before compiling the Rust application. Linux package
+installation currently supports Debian/Ubuntu; macOS uses Homebrew; Windows
+uses the UCRT64 MSYS2 environment installed by GHCup. Rust/Cargo itself must
+already be installed (for example via rustup).
 
-To prepare only the native library, run `./scripts/bootstrap-simplex.sh`.
-The Haskell compiler can coexist with the project's regular compiler through
-ghcup.
+To prepare only the native library, run the matching script under `scripts/`:
+`bootstrap-simplex.sh` on Linux, `bootstrap-simplex-macos.sh` on macOS, or
+`bootstrap-simplex-windows.ps1` from PowerShell on Windows. The Haskell compiler
+can coexist with the project's regular compiler through ghcup.
 
 For Rust-only checks in an environment where `libsimplex` is intentionally not
 available, set `SIMPLEX_SKIP_BOOTSTRAP=1`.
