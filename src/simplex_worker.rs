@@ -20,6 +20,11 @@ pub enum SimplexCommand {
         chat_ref: ChatRef,
         text: String,
     },
+    SendReaction {
+        chat_ref: ChatRef,
+        item_id: i64,
+        emoji: String,
+    },
     ActivateProfile(i64),
     CreateProfile(String),
     DeleteProfile(i64),
@@ -182,6 +187,17 @@ fn command_loop(
                             .map_err(|e| e.to_string())?,
                     }
                 }
+                SimplexCommand::SendReaction {
+                    chat_ref,
+                    item_id,
+                    emoji,
+                } => {
+                    let payload = serde_json::json!({"type": "emoji", "emoji": emoji});
+                    let response = controller
+                        .command(&format!("/_reaction {} {item_id} on {payload}", chat_ref.0))
+                        .map_err(|e| e.to_string())?;
+                    send_reaction_change(sender, &response)?;
+                }
                 SimplexCommand::ActivateProfile(user_id) => {
                     let result = (|| {
                         let response = controller
@@ -288,6 +304,7 @@ fn command_loop(
             .recv(Duration::from_millis(200))
             .map_err(|e| e.to_string())?
         {
+            send_reaction_change(sender, &value)?;
             if let Some((user_id, chat_ref)) = chat::connected_contact(&value) {
                 let chats = load_chats(&controller, user_id)?;
                 sender
@@ -301,6 +318,24 @@ fn command_loop(
             }
         }
     }
+}
+
+fn send_reaction_change(
+    sender: &Sender<SimplexEvent>,
+    value: &serde_json::Value,
+) -> Result<(), String> {
+    if let Some((chat_ref, item_id, emoji, added, user_reacted)) = chat::reaction_change(value) {
+        sender
+            .send(SimplexEvent::ReactionChanged {
+                chat_ref,
+                item_id,
+                emoji,
+                added,
+                user_reacted,
+            })
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
 }
 
 fn delete_profile(

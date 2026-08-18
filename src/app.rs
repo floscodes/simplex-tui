@@ -1,6 +1,6 @@
 use std::sync::Arc;
 use std::{
-    cell::Cell,
+    cell::{Cell, RefCell},
     collections::HashMap,
     io::{self, Write},
     sync::mpsc,
@@ -38,6 +38,20 @@ pub enum InputMode {
     None,
     CreateProfile,
     ConfirmDeleteProfile,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct MessageHitbox {
+    pub area: Rect,
+    pub item_id: i64,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ReactionPicker {
+    pub chat_ref: ChatRef,
+    pub item_id: i64,
+    pub column: u16,
+    pub row: u16,
 }
 
 /// All state owned by the user interface.
@@ -78,6 +92,9 @@ pub struct App {
     pub(crate) max_chat_scroll: Cell<usize>,
     pub(crate) delete_cancel_area: Cell<Rect>,
     pub(crate) delete_ok_area: Cell<Rect>,
+    pub(crate) message_hitboxes: RefCell<Vec<MessageHitbox>>,
+    pub(crate) reaction_picker: Option<ReactionPicker>,
+    pub(crate) reaction_option_areas: RefCell<Vec<(Rect, String)>>,
     pub events: EventHandler,
     message_cache: HashMap<ChatRef, Vec<Message>>,
     simplex_events: mpsc::Receiver<SimplexEvent>,
@@ -123,6 +140,9 @@ impl Default for App {
             max_chat_scroll: Cell::new(0),
             delete_cancel_area: Cell::new(Rect::default()),
             delete_ok_area: Cell::new(Rect::default()),
+            message_hitboxes: RefCell::new(Vec::new()),
+            reaction_picker: None,
+            reaction_option_areas: RefCell::new(Vec::new()),
             events: EventHandler::new(),
             message_cache: HashMap::new(),
             simplex_events,
@@ -341,8 +361,43 @@ impl App {
 
     fn handle_mouse_event(&mut self, kind: MouseEventKind, column: u16, row: u16) {
         let left_click = matches!(kind, MouseEventKind::Down(MouseButton::Left));
-        if left_click && !self.composer_area.get().contains((column, row).into()) {
+        let button_click = matches!(kind, MouseEventKind::Down(_));
+        if button_click && !self.composer_area.get().contains((column, row).into()) {
             self.composer_focused = false;
+        }
+        if left_click && self.reaction_picker.is_some() {
+            let emoji = self
+                .reaction_option_areas
+                .borrow()
+                .iter()
+                .find(|(area, _)| area.contains((column, row).into()))
+                .map(|(_, emoji)| emoji.clone());
+            if let Some(emoji) = emoji {
+                self.send_reaction(emoji);
+            } else {
+                self.reaction_picker = None;
+            }
+            return;
+        }
+        if matches!(kind, MouseEventKind::Down(MouseButton::Right)) {
+            let item_id = self
+                .message_hitboxes
+                .borrow()
+                .iter()
+                .rev()
+                .find(|hitbox| hitbox.area.contains((column, row).into()))
+                .map(|hitbox| hitbox.item_id);
+            if let (Some(chat_ref), Some(item_id)) = (self.selected_chat_ref().cloned(), item_id) {
+                self.reaction_picker = Some(ReactionPicker {
+                    chat_ref,
+                    item_id,
+                    column,
+                    row,
+                });
+            } else {
+                self.reaction_picker = None;
+            }
+            return;
         }
         if self.input_mode == InputMode::ConfirmDeleteProfile && left_click {
             if self.delete_ok_area.get().contains((column, row).into()) {
@@ -459,6 +514,7 @@ impl App {
             self.messages.clear();
             self.chat_loading = false;
             self.chat_error = None;
+            self.reaction_picker = None;
         }
     }
 
@@ -670,6 +726,26 @@ impl App {
                         self.chat_error = Some(error);
                     }
                 }
+                SimplexEvent::ReactionChanged {
+                    chat_ref,
+                    item_id,
+                    emoji,
+                    added,
+                    user_reacted,
+                } => {
+                    if self.loaded_chat.as_ref() == Some(&chat_ref) {
+                        update_message_reaction(
+                            &mut self.messages,
+                            item_id,
+                            &emoji,
+                            added,
+                            user_reacted,
+                        );
+                    }
+                    if let Some(messages) = self.message_cache.get_mut(&chat_ref) {
+                        update_message_reaction(messages, item_id, &emoji, added, user_reacted);
+                    }
+                }
                 SimplexEvent::NoActiveUser => self.startup = StartupState::NoActiveUser,
                 SimplexEvent::Failed(error) => self.startup = StartupState::Failed(error),
             }
@@ -726,6 +802,17 @@ impl App {
             self.sending = false;
             self.chat_error = Some("SimpleX worker is not available".into());
         }
+    }
+
+    fn send_reaction(&mut self, emoji: String) {
+        let Some(picker) = self.reaction_picker.take() else {
+            return;
+        };
+        let _ = self.simplex_commands.send(SimplexCommand::SendReaction {
+            chat_ref: picker.chat_ref,
+            item_id: picker.item_id,
+            emoji,
+        });
     }
 
     fn scroll_chat_up(&mut self, amount: usize) {
@@ -899,6 +986,39 @@ fn cache_message(cache: &mut HashMap<ChatRef, Vec<Message>>, chat_ref: &ChatRef,
     }
 }
 
+fn update_message_reaction(
+    messages: &mut [Message],
+    item_id: i64,
+    emoji: &str,
+    added: bool,
+    reacted_by_user: bool,
+) {
+    let Some(message) = messages.iter_mut().find(|message| message.id == item_id) else {
+        return;
+    };
+    if let Some(reaction) = message
+        .reactions
+        .iter_mut()
+        .find(|reaction| reaction.emoji == emoji)
+    {
+        reaction.count = if added {
+            reaction.count.saturating_add(1)
+        } else {
+            reaction.count.saturating_sub(1)
+        };
+        if reacted_by_user {
+            reaction.user_reacted = added;
+        }
+    } else if added {
+        message.reactions.push(crate::chat::MessageReaction {
+            emoji: emoji.to_owned(),
+            count: 1,
+            user_reacted: reacted_by_user,
+        });
+    }
+    message.reactions.retain(|reaction| reaction.count > 0);
+}
+
 fn ring_terminal_bell() {
     let mut stdout = io::stdout();
     let _ = stdout.write_all(b"\x07");
@@ -1042,6 +1162,7 @@ mod tests {
                     text: "hello".into(),
                     timestamp: String::new(),
                     outgoing: false,
+                    reactions: Vec::new(),
                 },
             })
             .unwrap();
@@ -1086,6 +1207,7 @@ mod tests {
                     text: "sent from the TUI".into(),
                     timestamp: String::new(),
                     outgoing: true,
+                    reactions: Vec::new(),
                 },
             })
             .unwrap();
@@ -1119,6 +1241,7 @@ mod tests {
                     text: "sent elsewhere".into(),
                     timestamp: String::new(),
                     outgoing: true,
+                    reactions: Vec::new(),
                 },
             })
             .unwrap();
@@ -1179,6 +1302,7 @@ mod tests {
             text: "from background".into(),
             timestamp: String::new(),
             outgoing: false,
+            reactions: Vec::new(),
         };
         event_sender
             .send(SimplexEvent::MessageReceived {

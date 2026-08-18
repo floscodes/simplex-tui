@@ -13,6 +13,8 @@ use tui_qrcode::{Colors, QrCodeWidget, Scaling};
 use crate::app::{App, InputMode, Section, StartupState};
 use crate::preferences::Theme;
 
+const REACTION_EMOJIS: [&str; 8] = ["👍", "👎", "😀", "😂", "😢", "❤", "🚀", "✅"];
+
 impl Widget for &App {
     fn render(self, area: Rect, buf: &mut Buffer) {
         match self.preferences.theme {
@@ -36,6 +38,8 @@ impl Widget for &App {
         self.jump_to_latest_area.set(Rect::default());
         self.delete_cancel_area.set(Rect::default());
         self.delete_ok_area.set(Rect::default());
+        self.message_hitboxes.borrow_mut().clear();
+        self.reaction_option_areas.borrow_mut().clear();
         let columns = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Percentage(32), Constraint::Percentage(68)])
@@ -50,6 +54,8 @@ impl Widget for &App {
         render_detail(self, columns[1], buf);
         if self.input_mode == InputMode::ConfirmDeleteProfile {
             render_delete_profile_confirmation(self, area, buf);
+        } else if self.reaction_picker.is_some() {
+            render_reaction_picker(self, area, buf);
         }
     }
 }
@@ -292,7 +298,13 @@ fn render_chat(app: &App, area: Rect, buf: &mut Buffer) {
         .map(|message| {
             let time = message.timestamp.get(11..16).unwrap_or("");
             let prefix = if message.outgoing { "You" } else { chat };
-            bubble_size(&message.text, prefix, time, rows[1].width)
+            bubble_size(
+                &message.text,
+                prefix,
+                time,
+                rows[1].width,
+                !message.reactions.is_empty(),
+            )
         })
         .collect();
     let gap = usize::from(!app.preferences.compact_messages);
@@ -447,7 +459,13 @@ fn render_chat(app: &App, area: Rect, buf: &mut Buffer) {
     }
 }
 
-fn bubble_size(text: &str, sender: &str, time: &str, area_width: u16) -> (u16, u16) {
+fn bubble_size(
+    text: &str,
+    sender: &str,
+    time: &str,
+    area_width: u16,
+    has_reactions: bool,
+) -> (u16, u16) {
     let available_width = area_width.saturating_sub(1).max(1);
     let max_width = available_width.saturating_mul(3).div_ceil(4).max(1);
     let title_width = sender.chars().count() + time.chars().count() + 5;
@@ -465,7 +483,12 @@ fn bubble_size(text: &str, sender: &str, time: &str, area_width: u16) -> (u16, u
         .map(|line| line.chars().count().max(1).div_ceil(content_width))
         .sum::<usize>()
         .max(1);
-    let height = u16::try_from(content_height.saturating_add(2)).unwrap_or(u16::MAX);
+    let height = u16::try_from(
+        content_height
+            .saturating_add(2)
+            .saturating_add(usize::from(has_reactions)),
+    )
+    .unwrap_or(u16::MAX);
     (height, desired)
 }
 
@@ -505,7 +528,9 @@ fn render_message_bubbles(
         } else {
             area.x
         };
-        let bubble_area = Rect::new(x, y, width, height);
+        let reaction_height = u16::from(!message.reactions.is_empty());
+        let frame_height = height.saturating_sub(reaction_height);
+        let bubble_area = Rect::new(x, y, width, frame_height);
         let time = message.timestamp.get(11..16).unwrap_or("");
         let sender = if message.outgoing { "You" } else { peer };
         let color = if message.outgoing {
@@ -525,9 +550,71 @@ fn render_message_bubbles(
             .block(bubble)
             .wrap(Wrap { trim: false })
             .render(bubble_area, buf);
+        app.message_hitboxes
+            .borrow_mut()
+            .push(crate::app::MessageHitbox {
+                area: bubble_area,
+                item_id: message.id,
+            });
+        if reaction_height > 0 {
+            let reaction_text = message
+                .reactions
+                .iter()
+                .map(|reaction| format!("{} {}", reaction.emoji, reaction.count))
+                .collect::<Vec<_>>()
+                .join("  ");
+            let reaction_area = Rect::new(x, bubble_area.bottom(), width, 1);
+            Paragraph::new(reaction_text)
+                .alignment(Alignment::Right)
+                .style(
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                )
+                .render(reaction_area, buf);
+        }
         y = y
             .saturating_add(height)
             .saturating_add(u16::try_from(gap).unwrap_or(0));
+    }
+}
+
+fn render_reaction_picker(app: &App, screen: Rect, buf: &mut Buffer) {
+    let Some(picker) = &app.reaction_picker else {
+        return;
+    };
+    let width = 26.min(screen.width);
+    let height = 3.min(screen.height);
+    let max_x = screen.right().saturating_sub(width);
+    let max_y = screen.bottom().saturating_sub(height);
+    let area = Rect::new(
+        picker.column.min(max_x).max(screen.x),
+        picker.row.min(max_y).max(screen.y),
+        width,
+        height,
+    );
+    Clear.render(area, buf);
+    let inner = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(Color::Cyan))
+        .inner(area);
+    Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(Color::Cyan))
+        .render(area, buf);
+    let options = Layout::horizontal(
+        REACTION_EMOJIS
+            .iter()
+            .map(|_| Constraint::Ratio(1, REACTION_EMOJIS.len() as u32)),
+    )
+    .split(inner);
+    for (emoji, option_area) in REACTION_EMOJIS.iter().zip(options.iter()) {
+        Paragraph::new(*emoji)
+            .alignment(Alignment::Center)
+            .render(*option_area, buf);
+        app.reaction_option_areas
+            .borrow_mut()
+            .push((*option_area, (*emoji).to_owned()));
     }
 }
 

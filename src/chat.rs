@@ -26,6 +26,14 @@ pub struct Message {
     pub text: String,
     pub timestamp: String,
     pub outgoing: bool,
+    pub reactions: Vec<MessageReaction>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MessageReaction {
+    pub emoji: String,
+    pub count: u64,
+    pub user_reacted: bool,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -89,6 +97,13 @@ pub enum SimplexEvent {
     MessageSendFailed {
         chat_ref: ChatRef,
         error: String,
+    },
+    ReactionChanged {
+        chat_ref: ChatRef,
+        item_id: i64,
+        emoji: String,
+        added: bool,
+        user_reacted: bool,
     },
     NoActiveUser,
     Failed(String),
@@ -166,6 +181,29 @@ pub fn connected_contact(value: &Value) -> Option<(i64, ChatRef)> {
     let user_id = result.pointer("/user/userId")?.as_i64()?;
     let contact_id = result.pointer("/contact/contactId")?.as_i64()?;
     Some((user_id, ChatRef(format!("@{contact_id}"))))
+}
+
+pub fn reaction_change(value: &Value) -> Option<(ChatRef, i64, String, bool, bool)> {
+    let result = value.get("result")?;
+    if result.get("type")?.as_str()? != "chatItemReaction" {
+        return None;
+    }
+    let reaction = result.get("reaction")?;
+    let chat_ref = chat_ref(reaction.get("chatInfo")?).ok()?;
+    let chat_reaction = reaction.get("chatReaction")?;
+    let item_id = chat_reaction.pointer("/chatItem/meta/itemId")?.as_i64()?;
+    let emoji = chat_reaction
+        .pointer("/reaction/emoji")?
+        .as_str()?
+        .to_owned();
+    let direction = chat_reaction.pointer("/chatDir/type")?.as_str()?;
+    Some((
+        chat_ref,
+        item_id,
+        emoji,
+        result.get("added")?.as_bool()?,
+        direction.to_ascii_lowercase().contains("snd"),
+    ))
 }
 
 fn collect_smp_servers(value: &Value, servers: &mut Vec<String>) {
@@ -397,6 +435,22 @@ fn parse_message(item: &Value) -> Option<Message> {
             .unwrap_or("")
             .to_owned(),
         outgoing: direction.to_ascii_lowercase().contains("snd"),
+        reactions: item
+            .get("reactions")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|reaction| {
+                Some(MessageReaction {
+                    emoji: reaction.pointer("/reaction/emoji")?.as_str()?.to_owned(),
+                    count: reaction.get("totalReacted")?.as_u64()?,
+                    user_reacted: reaction
+                        .get("userReacted")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
+                })
+            })
+            .collect(),
     })
 }
 
@@ -546,6 +600,46 @@ mod tests {
         assert_eq!(
             connected_contact(&json!({"result": {"type": "cmdOk"}})),
             None
+        );
+    }
+
+    #[test]
+    fn parses_message_reactions_and_live_reaction_changes() {
+        let item = json!({
+            "chatDir": {"type": "directRcv"},
+            "content": {"type": "rcvMsgContent", "msgContent": {"type": "text", "text": "hi"}},
+            "meta": {"itemId": 22, "itemText": "hi"},
+            "reactions": [{
+                "reaction": {"type": "emoji", "emoji": "👍"},
+                "userReacted": true,
+                "totalReacted": 3
+            }]
+        });
+        let message = parse_message(&item).unwrap();
+        assert_eq!(
+            message.reactions,
+            vec![MessageReaction {
+                emoji: "👍".into(),
+                count: 3,
+                user_reacted: true,
+            }]
+        );
+
+        let update = reaction_change(&json!({"result": {
+            "type": "chatItemReaction",
+            "added": true,
+            "reaction": {
+                "chatInfo": {"type": "direct", "contact": {"contactId": 7}},
+                "chatReaction": {
+                    "chatDir": {"type": "directRcv"},
+                    "chatItem": {"meta": {"itemId": 22}},
+                    "reaction": {"type": "emoji", "emoji": "😂"}
+                }
+            }
+        }}));
+        assert_eq!(
+            update,
+            Some((ChatRef("@7".into()), 22, "😂".into(), true, false))
         );
     }
 }
