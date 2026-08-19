@@ -48,8 +48,25 @@ pub enum SimplexCommand {
         chat_ref: ChatRef,
         seconds: Option<i64>,
     },
+    LoadConversationFeatures {
+        chat_ref: ChatRef,
+    },
+    SetConversationFeature {
+        chat_ref: ChatRef,
+        feature: ChatFeature,
+        enabled: bool,
+    },
+    DeleteChat {
+        user_id: i64,
+        chat_ref: ChatRef,
+        mode: ChatDeleteMode,
+    },
     CreateInvitation {
         user_id: i64,
+    },
+    ConnectInvitation {
+        user_id: i64,
+        link: String,
     },
     SetChatFeature {
         user_id: i64,
@@ -75,6 +92,13 @@ pub enum ChatFeature {
     Reactions,
     VoiceMessages,
     FilesAndMedia,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ChatDeleteMode {
+    Conversation,
+    Contact,
+    BlockContact,
 }
 
 struct DeletedProfileState {
@@ -356,6 +380,39 @@ fn command_loop(
                         })
                         .map_err(|e| e.to_string())?;
                 }
+                SimplexCommand::LoadConversationFeatures { chat_ref } => {
+                    let event = load_conversation_features(&controller, &chat_ref)
+                        .map(|features| SimplexEvent::ConversationFeaturesLoaded {
+                            chat_ref,
+                            features,
+                        })
+                        .unwrap_or_else(SimplexEvent::ConversationFeaturesFailed);
+                    sender.send(event).map_err(|e| e.to_string())?;
+                }
+                SimplexCommand::SetConversationFeature {
+                    chat_ref,
+                    feature,
+                    enabled,
+                } => {
+                    let event =
+                        update_conversation_feature(&controller, &chat_ref, feature, enabled)
+                            .map(|features| SimplexEvent::ConversationFeaturesChanged {
+                                chat_ref,
+                                features,
+                            })
+                            .unwrap_or_else(SimplexEvent::ConversationFeaturesFailed);
+                    sender.send(event).map_err(|e| e.to_string())?;
+                }
+                SimplexCommand::DeleteChat {
+                    user_id,
+                    chat_ref,
+                    mode,
+                } => {
+                    let event = delete_chat(&controller, user_id, &chat_ref, mode)
+                        .map(|chats| SimplexEvent::ChatDeleted { chat_ref, chats })
+                        .unwrap_or_else(SimplexEvent::ChatDeleteFailed);
+                    sender.send(event).map_err(|e| e.to_string())?;
+                }
                 SimplexCommand::CreateInvitation { user_id } => {
                     let event = controller
                         .command(&format!("/_connect {user_id} incognito=off"))
@@ -363,6 +420,18 @@ fn command_loop(
                         .and_then(|value| model::invitation_link(&value))
                         .map(SimplexEvent::InvitationCreated)
                         .unwrap_or_else(SimplexEvent::InvitationFailed);
+                    sender.send(event).map_err(|e| e.to_string())?;
+                }
+                SimplexCommand::ConnectInvitation { user_id, link } => {
+                    let event = validate_connection_link(&link)
+                        .and_then(|link| {
+                            controller
+                                .command(&format!("/_connect {user_id} incognito=off {link}"))
+                                .map_err(|e| e.to_string())
+                        })
+                        .and_then(|value| model::connection_started(&value))
+                        .map(|()| SimplexEvent::ConnectionStarted)
+                        .unwrap_or_else(SimplexEvent::ConnectionFailed);
                     sender.send(event).map_err(|e| e.to_string())?;
                 }
                 SimplexCommand::SetChatFeature {
@@ -442,6 +511,17 @@ fn command_loop(
             }
         }
     }
+}
+
+fn validate_connection_link(link: &str) -> Result<&str, String> {
+    let link = link.trim();
+    if link.is_empty() {
+        return Err("invitation link is empty".into());
+    }
+    if link.chars().any(char::is_whitespace) {
+        return Err("invitation link contains whitespace".into());
+    }
+    Ok(link)
 }
 
 fn receive_file(
@@ -719,6 +799,165 @@ fn update_chat_deletion(
         .map_err(|e| e.to_string())?;
     ensure_ok(&response, "local chat deletion")?;
     load_chat_deletion(controller, chat_ref)
+}
+
+fn load_conversation_features(
+    controller: &crate::ffi::SimplexController,
+    chat_ref: &ChatRef,
+) -> Result<model::ChatFeatures, String> {
+    let response = controller
+        .command(&format!("/_get chat {} count=1", chat_ref.0))
+        .map_err(|e| e.to_string())?;
+    let info = response
+        .pointer("/result/chat/chatInfo")
+        .ok_or("chat response has no chatInfo")?;
+    let (_, defaults) =
+        model::profile_and_features(&controller.command("/profile").map_err(|e| e.to_string())?)?;
+    match info.get("type").and_then(serde_json::Value::as_str) {
+        Some("direct") => Ok(features_from_preferences(
+            info.pointer("/contact/userPreferences"),
+            defaults,
+            false,
+        )),
+        Some("group") => Ok(features_from_preferences(
+            info.pointer("/groupInfo/groupProfile/groupPreferences"),
+            defaults,
+            true,
+        )),
+        _ => Err("chat feature settings are unsupported for this chat type".into()),
+    }
+}
+
+fn update_conversation_feature(
+    controller: &crate::ffi::SimplexController,
+    chat_ref: &ChatRef,
+    feature: ChatFeature,
+    enabled: bool,
+) -> Result<model::ChatFeatures, String> {
+    let response = controller
+        .command(&format!("/_get chat {} count=1", chat_ref.0))
+        .map_err(|e| e.to_string())?;
+    let info = response
+        .pointer("/result/chat/chatInfo")
+        .ok_or("chat response has no chatInfo")?;
+    let name = feature_name(feature);
+    match info.get("type").and_then(serde_json::Value::as_str) {
+        Some("direct") => {
+            let mut preferences = info
+                .pointer("/contact/userPreferences")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!({}));
+            set_contact_feature(&mut preferences, name, enabled)?;
+            set_contact_feature(&mut preferences, "calls", false)?;
+            let response = controller
+                .command(&format!("/_set prefs {} {preferences}", chat_ref.0))
+                .map_err(|e| e.to_string())?;
+            ensure_ok(&response, "contact feature")?;
+        }
+        Some("group") => {
+            let mut profile = info
+                .pointer("/groupInfo/groupProfile")
+                .cloned()
+                .ok_or("group chat has no group profile")?;
+            set_group_feature(&mut profile, name, enabled)?;
+            set_group_feature(&mut profile, "calls", false)?;
+            let response = controller
+                .command(&format!("/_group_profile {} {profile}", chat_ref.0))
+                .map_err(|e| e.to_string())?;
+            ensure_ok(&response, "group feature")?;
+        }
+        _ => return Err("chat feature settings are unsupported for this chat type".into()),
+    }
+    load_conversation_features(controller, chat_ref)
+}
+
+fn delete_chat(
+    controller: &crate::ffi::SimplexController,
+    user_id: i64,
+    chat_ref: &ChatRef,
+    mode: ChatDeleteMode,
+) -> Result<Vec<model::ChatSummary>, String> {
+    let suffix = match mode {
+        ChatDeleteMode::Conversation => "messages",
+        ChatDeleteMode::Contact if chat_ref.0.starts_with('@') => "full notify=on",
+        ChatDeleteMode::BlockContact if chat_ref.0.starts_with('@') => "full notify=off",
+        ChatDeleteMode::Contact | ChatDeleteMode::BlockContact => {
+            return Err("contact actions are only available for direct chats".into());
+        }
+    };
+    let response = controller
+        .command(&format!("/_delete {} {suffix}", chat_ref.0))
+        .map_err(|e| e.to_string())?;
+    ensure_ok(&response, "chat deletion")?;
+    load_chats(controller, user_id)
+}
+
+fn feature_name(feature: ChatFeature) -> &'static str {
+    match feature {
+        ChatFeature::FullDeletion => "fullDelete",
+        ChatFeature::Reactions => "reactions",
+        ChatFeature::VoiceMessages => "voice",
+        ChatFeature::FilesAndMedia => "files",
+    }
+}
+
+fn features_from_preferences(
+    preferences: Option<&serde_json::Value>,
+    defaults: model::ChatFeatures,
+    group: bool,
+) -> model::ChatFeatures {
+    let enabled = |name: &str, default: bool| {
+        let value = preferences
+            .and_then(|prefs| prefs.get(name))
+            .and_then(|pref| pref.get(if group { "enable" } else { "allow" }))
+            .and_then(serde_json::Value::as_str);
+        match value {
+            Some("no" | "off") => false,
+            Some("yes" | "always" | "on") => true,
+            _ => default,
+        }
+    };
+    model::ChatFeatures {
+        disappearing_messages: defaults.disappearing_messages,
+        full_deletion: enabled("fullDelete", defaults.full_deletion),
+        reactions: enabled("reactions", defaults.reactions),
+        voice_messages: enabled("voice", defaults.voice_messages),
+        files_and_media: enabled("files", defaults.files_and_media),
+    }
+}
+
+fn set_contact_feature(
+    preferences: &mut serde_json::Value,
+    name: &str,
+    enabled: bool,
+) -> Result<(), String> {
+    preferences
+        .as_object_mut()
+        .ok_or("contact preferences are not an object")?
+        .insert(
+            name.into(),
+            serde_json::json!({"allow": if enabled { "yes" } else { "no" }}),
+        );
+    Ok(())
+}
+
+fn set_group_feature(
+    profile: &mut serde_json::Value,
+    name: &str,
+    enabled: bool,
+) -> Result<(), String> {
+    profile
+        .as_object_mut()
+        .ok_or("group profile is not an object")?
+        .entry("groupPreferences")
+        .or_insert_with(|| serde_json::json!({}))
+        .as_object_mut()
+        .ok_or("group preferences are not an object")?
+        .insert(
+            name.into(),
+            serde_json::json!({"enable": if enabled { "on" } else { "off" }}),
+        );
+    Ok(())
 }
 
 fn set_timed_preference(
@@ -1008,4 +1247,42 @@ fn send_auto_delete(
     sender
         .send(SimplexEvent::AutoDeleteLoaded(seconds))
         .map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn conversation_preferences_override_profile_defaults() {
+        let defaults = model::ChatFeatures {
+            full_deletion: false,
+            reactions: true,
+            voice_messages: true,
+            files_and_media: true,
+            ..model::ChatFeatures::default()
+        };
+        let direct = serde_json::json!({
+            "fullDelete": {"allow": "yes"},
+            "reactions": {"allow": "no"}
+        });
+        let features = features_from_preferences(Some(&direct), defaults.clone(), false);
+        assert!(features.full_deletion);
+        assert!(!features.reactions);
+        assert!(features.voice_messages);
+
+        let group = serde_json::json!({
+            "voice": {"enable": "off"},
+            "files": {"enable": "on"}
+        });
+        let features = features_from_preferences(Some(&group), defaults, true);
+        assert!(!features.voice_messages);
+        assert!(features.files_and_media);
+    }
+
+    #[test]
+    fn connection_links_cannot_inject_another_command() {
+        assert!(validate_connection_link("simplex:/invitation#example").is_ok());
+        assert!(validate_connection_link("simplex:/invitation#example\n/_delete @1").is_err());
+    }
 }

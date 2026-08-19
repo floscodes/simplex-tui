@@ -1,7 +1,7 @@
 use crate::app::App;
 use crossterm::event::{
-    DisableMouseCapture, EnableMouseCapture, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
-    PushKeyboardEnhancementFlags,
+    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
 use directories::{BaseDirs, UserDirs};
@@ -41,10 +41,16 @@ async fn run(
     execute!(
         stdout(),
         EnableMouseCapture,
+        EnableBracketedPaste,
         PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
     )?;
     let result = App::new(session, data_directory).run(terminal).await;
-    let input_result = execute!(stdout(), PopKeyboardEnhancementFlags, DisableMouseCapture);
+    let input_result = execute!(
+        stdout(),
+        PopKeyboardEnhancementFlags,
+        DisableBracketedPaste,
+        DisableMouseCapture
+    );
     ratatui::restore();
     input_result?;
     result

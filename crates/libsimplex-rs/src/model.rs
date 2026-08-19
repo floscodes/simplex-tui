@@ -136,6 +136,20 @@ pub enum SimplexEvent {
         settings: ChatDeletionSettings,
     },
     ChatDeletionFailed(String),
+    ConversationFeaturesLoaded {
+        chat_ref: ChatRef,
+        features: ChatFeatures,
+    },
+    ConversationFeaturesChanged {
+        chat_ref: ChatRef,
+        features: ChatFeatures,
+    },
+    ConversationFeaturesFailed(String),
+    ChatDeleted {
+        chat_ref: ChatRef,
+        chats: Vec<ChatSummary>,
+    },
+    ChatDeleteFailed(String),
     FileDownloadStarted {
         file_id: i64,
         path: String,
@@ -156,6 +170,8 @@ pub enum SimplexEvent {
     ChatFeaturesLoaded(ChatFeatures),
     InvitationCreated(String),
     InvitationFailed(String),
+    ConnectionStarted,
+    ConnectionFailed(String),
     ChatLoaded {
         chat_ref: ChatRef,
         messages: Vec<Message>,
@@ -210,6 +226,22 @@ pub fn invitation_link(value: &Value) -> Result<String, String> {
         })
         .ok_or("invitation response has no connection link")?;
     Ok(link.to_owned())
+}
+
+pub fn connection_started(value: &Value) -> Result<(), String> {
+    let result = value
+        .get("result")
+        .ok_or_else(|| response_error(value, "connection confirmation"))?;
+    match result.get("type").and_then(Value::as_str) {
+        Some(
+            "sentConfirmation"
+            | "sentInvitation"
+            | "startedConnectionToContact"
+            | "startedConnectionToGroup"
+            | "sentInvitationToContact",
+        ) => Ok(()),
+        _ => Err(response_error(value, "connection confirmation")),
+    }
 }
 
 #[cfg(test)]
@@ -783,6 +815,23 @@ mod tests {
         }}))
         .unwrap();
         assert_eq!(link, "https://simplex.chat/contact#short");
+    }
+
+    #[test]
+    fn recognizes_started_invitation_connections() {
+        for response_type in [
+            "sentConfirmation",
+            "sentInvitation",
+            "startedConnectionToContact",
+            "startedConnectionToGroup",
+            "sentInvitationToContact",
+        ] {
+            assert!(
+                connection_started(&json!({"result": {"type": response_type}})).is_ok(),
+                "{response_type} should confirm a started connection"
+            );
+        }
+        assert!(connection_started(&json!({"error": {"type": "chatCmdError"}})).is_err());
     }
 
     #[test]

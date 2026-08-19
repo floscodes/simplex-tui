@@ -10,7 +10,7 @@ mod model;
 
 use std::{path::Path, path::PathBuf, sync::Arc, sync::mpsc};
 
-pub use client::{ChatFeature, SimplexCommand as Command};
+pub use client::{ChatDeleteMode, ChatFeature, SimplexCommand as Command};
 pub use ffi::SimplexError as Error;
 pub use model::{
     Attachment, AttachmentKind, ChatDeletionSettings, ChatFeatures, ChatRef, ChatSummary, Message,

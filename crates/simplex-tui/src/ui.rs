@@ -13,7 +13,7 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::app::{App, InputMode, Section, StartupState};
 use crate::preferences::Theme;
-use libsimplex_rs::{AttachmentKind, Message};
+use libsimplex_rs::{AttachmentKind, ChatDeleteMode, Message};
 
 const REACTION_EMOJIS: [&str; 8] = ["👍", "👎", "😀", "😂", "😢", "❤", "🚀", "✅"];
 
@@ -46,6 +46,7 @@ impl Widget for &App {
         self.download_cancel_yes_area.set(Rect::default());
         self.message_hitboxes.borrow_mut().clear();
         self.reaction_option_areas.borrow_mut().clear();
+        self.chat_setting_areas.borrow_mut().clear();
         let columns = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Percentage(32), Constraint::Percentage(68)])
@@ -60,6 +61,8 @@ impl Widget for &App {
         render_detail(self, columns[1], buf);
         if self.download_cancel_dialog.is_some() {
             render_download_cancel_confirmation(self, area, buf);
+        } else if self.chat_delete_confirmation.is_some() {
+            render_chat_delete_confirmation(self, area, buf);
         } else if self.input_mode == InputMode::ConfirmDeleteProfile {
             render_delete_profile_confirmation(self, area, buf);
         } else if self.chat_deletion_dialog.is_some() {
@@ -76,6 +79,17 @@ fn panel(title: &str) -> Block<'_> {
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(Color::DarkGray))
         .title(format!(" {title} "))
+}
+
+fn centered_rect(area: Rect, width: u16, height: u16) -> Rect {
+    let width = area.width.min(width);
+    let height = area.height.min(height);
+    Rect::new(
+        area.x + area.width.saturating_sub(width) / 2,
+        area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    )
 }
 
 fn render_tabs(app: &App, area: Rect, buf: &mut Buffer) {
@@ -129,7 +143,7 @@ fn render_sidebar(app: &App, area: Rect, buf: &mut Buffer) {
                         format!("{} ({})", chat.display_name, chat.unread_count)
                     }
                 })
-                .chain(app.active_user().map(|_| "＋ Invite contact".to_owned()))
+                .chain(app.active_user().map(|_| "＋ Invite or connect".to_owned()))
                 .collect(),
             app.selected_chat,
         ),
@@ -320,8 +334,8 @@ fn render_chat_deletion_dialog(app: &App, area: Rect, buf: &mut Buffer) {
     let Some(dialog) = &app.chat_deletion_dialog else {
         return;
     };
-    let width = area.width.min(72);
-    let height = area.height.min(14);
+    let width = area.width.min(76);
+    let height = area.height.min(25);
     let popup = Rect::new(
         area.x + area.width.saturating_sub(width) / 2,
         area.y + area.height.saturating_sub(height) / 2,
@@ -333,52 +347,156 @@ fn render_chat_deletion_dialog(app: &App, area: Rect, buf: &mut Buffer) {
         .iter()
         .find(|chat| chat.chat_ref == dialog.chat_ref)
         .map_or("Chat", |chat| chat.display_name.as_str());
-    let status = if let Some(error) = &dialog.error {
-        format!("Could not update the setting:\n{error}")
-    } else if dialog.pending {
-        "Loading/updating…".into()
-    } else if let Some(settings) = &dialog.settings {
+    let deletion = if let Some(settings) = &dialog.settings {
         if settings.local_ttl == settings.disappearing_ttl {
-            format!("Current: {}", chat_delete_label(settings.local_ttl))
+            chat_delete_label(settings.local_ttl).to_owned()
         } else {
             format!(
-                "Current: mixed\nLocal: {} · counterpart: {}",
+                "Mixed (local: {}, counterpart: {})",
                 chat_delete_label(settings.local_ttl),
                 chat_delete_label(settings.disappearing_ttl)
             )
         }
     } else {
-        "Loading/updating…".into()
+        "Loading…".into()
     };
+    let features = dialog.features.clone().unwrap_or_default();
+    let direct = dialog.chat_ref.0.starts_with('@');
+    let values = [
+        format!("Message deletion       {deletion}"),
+        format!("Full deletion          {}", enabled(features.full_deletion)),
+        format!("Message reactions      {}", enabled(features.reactions)),
+        format!(
+            "Voice messages         {}",
+            enabled(features.voice_messages)
+        ),
+        format!(
+            "Files and media        {}",
+            enabled(features.files_and_media)
+        ),
+        "Delete conversation".into(),
+        if direct {
+            "Delete contact"
+        } else {
+            "Delete contact (direct chats only)"
+        }
+        .into(),
+        if direct {
+            "Block & delete contact"
+        } else {
+            "Block contact (direct chats only)"
+        }
+        .into(),
+        "Close".into(),
+    ];
+    let lines = values.into_iter().enumerate().map(|(index, value)| {
+        let selected = index == dialog.selected;
+        Line::from(Span::styled(
+            format!("{} {value}", if selected { "●" } else { " " }),
+            if selected {
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD)
+            } else if (5..=7).contains(&index) {
+                Style::default().fg(Color::LightRed)
+            } else {
+                Style::default()
+            },
+        ))
+    });
     Clear.render(popup, buf);
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(Color::Cyan))
-        .title(format!(" Message deletion · {chat_name} "))
+        .title(format!(" Chat settings · {chat_name} "))
         .padding(Padding::new(2, 2, 1, 1));
     let inner = block.inner(popup);
     block.render(popup, buf);
-    let rows = Layout::vertical([Constraint::Min(4), Constraint::Length(3)]).split(inner);
+    let rows = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Min(9),
+        Constraint::Length(2),
+    ])
+    .split(inner);
+    Paragraph::new(if dialog.pending {
+        "Updating…"
+    } else if dialog.error.is_some() {
+        "Update failed"
+    } else {
+        "↑/↓: select · Enter/Space: change"
+    })
+    .fg(if dialog.error.is_some() {
+        Color::Red
+    } else {
+        Color::DarkGray
+    })
+    .render(rows[0], buf);
+    for (index, line) in lines.enumerate() {
+        if index >= usize::from(rows[1].height) {
+            break;
+        }
+        let line_area = Rect::new(
+            rows[1].x,
+            rows[1].y.saturating_add(index as u16),
+            rows[1].width,
+            1,
+        );
+        app.chat_setting_areas.borrow_mut().push((line_area, index));
+        Paragraph::new(line).render(line_area, buf);
+    }
+    let footer = dialog.error.as_deref().unwrap_or(
+        "Audio/video calls: Disabled (fixed) · Message deletion combines local and disappearing messages.",
+    );
+    Paragraph::new(footer)
+        .fg(if dialog.error.is_some() {
+            Color::Red
+        } else {
+            Color::DarkGray
+        })
+        .wrap(Wrap { trim: false })
+        .render(rows[2], buf);
+}
+
+fn render_chat_delete_confirmation(app: &App, area: Rect, buf: &mut Buffer) {
+    let Some(dialog) = &app.chat_delete_confirmation else {
+        return;
+    };
+    let action = match dialog.mode {
+        ChatDeleteMode::Conversation => "delete the conversation",
+        ChatDeleteMode::Contact => "delete the contact and notify them",
+        ChatDeleteMode::BlockContact => "block and delete the contact without notification",
+    };
+    let popup = centered_rect(area, 68, 11);
+    Clear.render(popup, buf);
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(Color::LightRed))
+        .title(" Confirm destructive action ")
+        .padding(Padding::new(2, 2, 1, 1));
+    let inner = block.inner(popup);
+    block.render(popup, buf);
+    let rows = Layout::vertical([Constraint::Min(3), Constraint::Length(3)]).split(inner);
     Paragraph::new(format!(
-        "{status}\n\nThis combines local deletion with SimpleX disappearing messages for this conversation."
+        "Are you sure you want to {action} “{}”?",
+        dialog.chat_name
     ))
     .wrap(Wrap { trim: false })
     .render(rows[0], buf);
     let buttons =
-        Layout::horizontal([Constraint::Percentage(38), Constraint::Percentage(62)]).split(rows[1]);
+        Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).split(rows[1]);
     app.chat_deletion_close_area.set(buttons[0]);
     app.chat_deletion_change_area.set(buttons[1]);
-    Paragraph::new("Close (Esc)")
-        .alignment(Alignment::Center)
-        .block(Block::bordered().border_type(BorderType::Rounded))
-        .render(buttons[0], buf);
-    Paragraph::new("Change (Enter/Space)")
+    Paragraph::new("No (Enter)")
         .alignment(Alignment::Center)
         .block(
             Block::bordered()
                 .border_type(BorderType::Rounded)
                 .border_style(Style::default().fg(Color::Cyan)),
         )
+        .render(buttons[0], buf);
+    Paragraph::new("Yes (y)")
+        .alignment(Alignment::Center)
+        .block(Block::bordered().border_type(BorderType::Rounded))
         .render(buttons[1], buf);
 }
 
@@ -410,7 +528,7 @@ fn render_chat(app: &App, area: Rect, buf: &mut Buffer) {
                 if user.display_name.is_empty() {
                     "No conversations yet."
                 } else {
-                    "No conversations yet.\n\nPress n to create a one-time invitation link."
+                    "No conversations yet.\n\nPress n to create an invitation or p to paste one."
                 },
             ),
             StartupState::Failed(error) => ("SimpleX error", error.as_str()),
@@ -601,7 +719,7 @@ fn render_chat(app: &App, area: Rect, buf: &mut Buffer) {
     .render(symbol_area, buf);
 
     if let Some(footer) = rows.last() {
-        Paragraph::new("Enter: send · Shift+Enter: newline · s: deletion · PgUp/PgDn: scroll")
+        Paragraph::new("Enter: send · Shift+Enter: newline · s: chat settings · PgUp/PgDn: scroll")
             .alignment(Alignment::Center)
             .fg(Color::DarkGray)
             .render(*footer, buf);
@@ -849,6 +967,31 @@ fn render_invitation(app: &App, area: Rect, buf: &mut Buffer) {
     let inner = block.inner(area);
     block.render(area, buf);
 
+    if app.input_mode == InputMode::ConnectInvitation {
+        Paragraph::new(format!(
+            "Connect via invitation link\n\nPaste the SimpleX link below:\n\n{}▏\n\nEnter: connect · Esc: cancel",
+            app.input
+        ))
+        .wrap(Wrap { trim: false })
+        .render(inner, buf);
+        return;
+    }
+    if app.connection_loading {
+        Paragraph::new("Starting the secure SimpleX connection…")
+            .alignment(Alignment::Center)
+            .fg(Color::Cyan)
+            .render(inner, buf);
+        return;
+    }
+    if let Some(error) = &app.connection_error {
+        Paragraph::new(format!(
+            "Could not use invitation link:\n\n{error}\n\nPress p to paste another link."
+        ))
+        .fg(Color::Red)
+        .wrap(Wrap { trim: false })
+        .render(inner, buf);
+        return;
+    }
     if app.invitation_loading {
         Paragraph::new("Creating a secure one-time invitation via SimpleX…")
             .alignment(Alignment::Center)
@@ -866,7 +1009,9 @@ fn render_invitation(app: &App, area: Rect, buf: &mut Buffer) {
         return;
     }
     let Some(link) = &app.invitation_link else {
-        Paragraph::new("Press Enter to create a one-time invitation link.")
+        Paragraph::new(
+            "Press Enter to create a one-time invitation link.\n\nPress p to paste a link received from somebody else.",
+        )
             .alignment(Alignment::Center)
             .render(inner, buf);
         return;
@@ -893,7 +1038,7 @@ fn render_invitation(app: &App, area: Rect, buf: &mut Buffer) {
         .alignment(Alignment::Center)
         .wrap(Wrap { trim: false })
         .render(rows[2], buf);
-    Paragraph::new("One-time link · r: create a new invitation")
+    Paragraph::new("One-time link · r: create new · p: paste received link")
         .alignment(Alignment::Center)
         .fg(Color::DarkGray)
         .render(rows[3], buf);

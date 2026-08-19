@@ -10,7 +10,7 @@ use crate::event::{AppEvent, Event, EventHandler};
 use crate::preferences::Preferences;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind};
 use libsimplex_rs::{
-    ChatDeletionSettings, ChatFeature, ChatFeatures, ChatRef, ChatSummary,
+    ChatDeleteMode, ChatDeletionSettings, ChatFeature, ChatFeatures, ChatRef, ChatSummary,
     Command as SimplexCommand, Event as SimplexEvent, Message, Profile, ServerEntry,
     ServerProtocol, Session, User,
 };
@@ -39,6 +39,7 @@ pub enum InputMode {
     CreateProfile,
     ConfirmDeleteProfile,
     AddServer,
+    ConnectInvitation,
 }
 
 #[derive(Clone, Debug)]
@@ -59,8 +60,17 @@ pub(crate) struct ReactionPicker {
 pub(crate) struct ChatDeletionDialog {
     pub chat_ref: ChatRef,
     pub settings: Option<ChatDeletionSettings>,
+    pub features: Option<ChatFeatures>,
+    pub selected: usize,
     pub pending: bool,
     pub error: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ChatDeleteConfirmation {
+    pub chat_ref: ChatRef,
+    pub chat_name: String,
+    pub mode: ChatDeleteMode,
 }
 
 #[derive(Clone, Debug)]
@@ -99,6 +109,8 @@ pub struct App {
     pub invitation_link: Option<String>,
     pub invitation_loading: bool,
     pub invitation_error: Option<String>,
+    pub connection_loading: bool,
+    pub connection_error: Option<String>,
     pub input_mode: InputMode,
     pub input: String,
     pub notice: Option<String>,
@@ -113,10 +125,12 @@ pub struct App {
     pub(crate) delete_ok_area: Cell<Rect>,
     pub(crate) chat_deletion_close_area: Cell<Rect>,
     pub(crate) chat_deletion_change_area: Cell<Rect>,
+    pub(crate) chat_setting_areas: RefCell<Vec<(Rect, usize)>>,
     pub(crate) message_hitboxes: RefCell<Vec<MessageHitbox>>,
     pub(crate) reaction_picker: Option<ReactionPicker>,
     pub(crate) reaction_option_areas: RefCell<Vec<(Rect, String)>>,
     pub(crate) chat_deletion_dialog: Option<ChatDeletionDialog>,
+    pub(crate) chat_delete_confirmation: Option<ChatDeleteConfirmation>,
     pub(crate) download_cancel_dialog: Option<DownloadCancelDialog>,
     pub(crate) download_cancel_no_area: Cell<Rect>,
     pub(crate) download_cancel_yes_area: Cell<Rect>,
@@ -158,6 +172,8 @@ impl Default for App {
             invitation_link: None,
             invitation_loading: false,
             invitation_error: None,
+            connection_loading: false,
+            connection_error: None,
             input_mode: InputMode::None,
             input: String::new(),
             notice: None,
@@ -171,10 +187,12 @@ impl Default for App {
             delete_ok_area: Cell::new(Rect::default()),
             chat_deletion_close_area: Cell::new(Rect::default()),
             chat_deletion_change_area: Cell::new(Rect::default()),
+            chat_setting_areas: RefCell::new(Vec::new()),
             message_hitboxes: RefCell::new(Vec::new()),
             reaction_picker: None,
             reaction_option_areas: RefCell::new(Vec::new()),
             chat_deletion_dialog: None,
+            chat_delete_confirmation: None,
             download_cancel_dialog: None,
             download_cancel_no_area: Cell::new(Rect::default()),
             download_cancel_yes_area: Cell::new(Rect::default()),
@@ -232,6 +250,7 @@ impl App {
                     crossterm::event::Event::Mouse(mouse) => {
                         self.handle_mouse_event(mouse.kind, mouse.column, mouse.row)
                     }
+                    crossterm::event::Event::Paste(text) => self.handle_paste(text),
                     _ => {}
                 },
                 Event::App(app_event) => self.handle_app_event(app_event),
@@ -250,6 +269,16 @@ impl App {
                 KeyCode::Char('y') => self.confirm_cancel_download(),
                 KeyCode::Enter | KeyCode::Esc | KeyCode::Char('n') => {
                     self.download_cancel_dialog = None
+                }
+                _ => {}
+            }
+            return Ok(());
+        }
+        if self.chat_delete_confirmation.is_some() {
+            match key.code {
+                KeyCode::Char('y') => self.confirm_chat_delete(),
+                KeyCode::Enter | KeyCode::Esc | KeyCode::Char('n') => {
+                    self.chat_delete_confirmation = None
                 }
                 _ => {}
             }
@@ -310,10 +339,29 @@ impl App {
             }
             return Ok(());
         }
+        if self.input_mode == InputMode::ConnectInvitation {
+            match key.code {
+                KeyCode::Esc => {
+                    self.input_mode = InputMode::None;
+                    self.input.clear();
+                }
+                KeyCode::Enter if !self.input.trim().is_empty() => self.connect_invitation(),
+                KeyCode::Backspace => {
+                    self.input.pop();
+                }
+                KeyCode::Char(character) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.input.push(character)
+                }
+                _ => {}
+            }
+            return Ok(());
+        }
         if self.chat_deletion_dialog.is_some() {
             match key.code {
                 KeyCode::Esc => self.chat_deletion_dialog = None,
-                KeyCode::Enter | KeyCode::Char(' ') => self.cycle_chat_deletion(),
+                KeyCode::Up | KeyCode::Char('k') => self.select_chat_setting_up(),
+                KeyCode::Down | KeyCode::Char('j') => self.select_chat_setting_down(),
+                KeyCode::Enter | KeyCode::Char(' ') => self.activate_chat_setting(),
                 _ => {}
             }
             return Ok(());
@@ -341,6 +389,7 @@ impl App {
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') => self.events.send(AppEvent::Quit),
             KeyCode::Char('n') if self.section == Section::Chats => self.show_invitation(),
+            KeyCode::Char('p') if self.section == Section::Chats => self.show_connect_invitation(),
             KeyCode::Char('s')
                 if self.section == Section::Chats && self.selected_chat < self.chats.len() =>
             {
@@ -482,19 +531,34 @@ impl App {
             }
             return;
         }
-        if left_click && self.chat_deletion_dialog.is_some() {
+        if left_click && self.chat_delete_confirmation.is_some() {
             if self
                 .chat_deletion_change_area
                 .get()
                 .contains((column, row).into())
             {
-                self.cycle_chat_deletion();
+                self.confirm_chat_delete();
             } else if self
                 .chat_deletion_close_area
                 .get()
                 .contains((column, row).into())
             {
-                self.chat_deletion_dialog = None;
+                self.chat_delete_confirmation = None;
+            }
+            return;
+        }
+        if left_click && self.chat_deletion_dialog.is_some() {
+            let selected = self
+                .chat_setting_areas
+                .borrow()
+                .iter()
+                .find(|(area, _)| area.contains((column, row).into()))
+                .map(|(_, index)| *index);
+            if let Some(selected) = selected {
+                if let Some(dialog) = &mut self.chat_deletion_dialog {
+                    dialog.selected = selected;
+                }
+                self.activate_chat_setting();
             }
             return;
         }
@@ -785,6 +849,41 @@ impl App {
                         dialog.error = Some(error);
                     }
                 }
+                SimplexEvent::ConversationFeaturesLoaded { chat_ref, features }
+                | SimplexEvent::ConversationFeaturesChanged { chat_ref, features } => {
+                    if let Some(dialog) = &mut self.chat_deletion_dialog
+                        && dialog.chat_ref == chat_ref
+                    {
+                        dialog.features = Some(features);
+                        dialog.pending = false;
+                        dialog.error = None;
+                    }
+                }
+                SimplexEvent::ConversationFeaturesFailed(error) => {
+                    if let Some(dialog) = &mut self.chat_deletion_dialog {
+                        dialog.pending = false;
+                        dialog.error = Some(error);
+                    }
+                }
+                SimplexEvent::ChatDeleted { chat_ref, chats } => {
+                    self.chats = chats;
+                    self.message_cache.remove(&chat_ref);
+                    self.selected_chat = self.selected_chat.min(self.chats.len().saturating_sub(1));
+                    self.loaded_chat = None;
+                    self.messages.clear();
+                    self.chat_deletion_dialog = None;
+                    self.chat_delete_confirmation = None;
+                    self.notice = Some("Chat updated".into());
+                }
+                SimplexEvent::ChatDeleteFailed(error) => {
+                    self.chat_delete_confirmation = None;
+                    if let Some(dialog) = &mut self.chat_deletion_dialog {
+                        dialog.pending = false;
+                        dialog.error = Some(error);
+                    } else {
+                        self.notice = Some(format!("Could not delete chat: {error}"));
+                    }
+                }
                 SimplexEvent::FileDownloadStarted { file_id, path } => {
                     update_attachment_status(
                         &mut self.messages,
@@ -838,6 +937,15 @@ impl App {
                     self.invitation_loading = false;
                     self.invitation_error = Some(error);
                 }
+                SimplexEvent::ConnectionStarted => {
+                    self.connection_loading = false;
+                    self.connection_error = None;
+                    self.notice = Some("Connection request sent; waiting for contact…".into());
+                }
+                SimplexEvent::ConnectionFailed(error) => {
+                    self.connection_loading = false;
+                    self.connection_error = Some(error);
+                }
                 SimplexEvent::ChatLoaded {
                     chat_ref,
                     mut messages,
@@ -886,6 +994,8 @@ impl App {
                     self.invitation_link = None;
                     self.invitation_loading = false;
                     self.invitation_error = None;
+                    self.connection_loading = false;
+                    self.connection_error = None;
                     self.jump_to_latest();
                     self.notice = Some("Contact connected".into());
                 }
@@ -1092,6 +1202,46 @@ impl App {
         }
     }
 
+    fn show_connect_invitation(&mut self) {
+        if self.active_user().is_none() {
+            self.notice = Some("Create a profile first".into());
+            return;
+        }
+        self.selected_chat = self.chats.len();
+        self.input_mode = InputMode::ConnectInvitation;
+        self.input.clear();
+        self.connection_error = None;
+    }
+
+    fn connect_invitation(&mut self) {
+        let Some(user_id) = self.active_user().map(|user| user.id) else {
+            self.notice = Some("Create a profile first".into());
+            return;
+        };
+        let link = self.input.trim().to_owned();
+        if link.is_empty() || self.connection_loading {
+            return;
+        }
+        self.input_mode = InputMode::None;
+        self.input.clear();
+        self.connection_loading = true;
+        self.connection_error = None;
+        if self
+            .simplex_commands
+            .send(SimplexCommand::ConnectInvitation { user_id, link })
+            .is_err()
+        {
+            self.connection_loading = false;
+            self.connection_error = Some("SimpleX worker is not available".into());
+        }
+    }
+
+    fn handle_paste(&mut self, text: String) {
+        if self.input_mode == InputMode::ConnectInvitation {
+            self.input.push_str(text.trim());
+        }
+    }
+
     fn toggle_chat_feature(&mut self, feature: ChatFeature, enabled: bool) {
         let Some(user_id) = self.active_user().map(|user| user.id) else {
             self.notice = Some("Create a profile first".into());
@@ -1195,12 +1345,19 @@ impl App {
         self.chat_deletion_dialog = Some(ChatDeletionDialog {
             chat_ref: chat_ref.clone(),
             settings: None,
+            features: None,
+            selected: 0,
             pending: true,
             error: None,
         });
         let _ = self
             .simplex_commands
-            .send(SimplexCommand::LoadChatDeletion { chat_ref });
+            .send(SimplexCommand::LoadChatDeletion {
+                chat_ref: chat_ref.clone(),
+            });
+        let _ = self
+            .simplex_commands
+            .send(SimplexCommand::LoadConversationFeatures { chat_ref });
     }
 
     fn download_attachment(&mut self, item_id: i64) -> bool {
@@ -1273,6 +1430,101 @@ impl App {
             user_id,
             chat_ref: dialog.chat_ref.clone(),
             seconds,
+        });
+    }
+
+    fn select_chat_setting_up(&mut self) {
+        if let Some(dialog) = &mut self.chat_deletion_dialog {
+            dialog.selected = dialog.selected.saturating_sub(1);
+        }
+    }
+
+    fn select_chat_setting_down(&mut self) {
+        if let Some(dialog) = &mut self.chat_deletion_dialog {
+            dialog.selected = dialog.selected.saturating_add(1).min(8);
+        }
+    }
+
+    fn activate_chat_setting(&mut self) {
+        let Some(dialog) = &self.chat_deletion_dialog else {
+            return;
+        };
+        if dialog.pending {
+            return;
+        }
+        match dialog.selected {
+            0 => self.cycle_chat_deletion(),
+            1 => self.toggle_conversation_feature(ChatFeature::FullDeletion),
+            2 => self.toggle_conversation_feature(ChatFeature::Reactions),
+            3 => self.toggle_conversation_feature(ChatFeature::VoiceMessages),
+            4 => self.toggle_conversation_feature(ChatFeature::FilesAndMedia),
+            5 => self.ask_chat_delete(ChatDeleteMode::Conversation),
+            6 => self.ask_chat_delete(ChatDeleteMode::Contact),
+            7 => self.ask_chat_delete(ChatDeleteMode::BlockContact),
+            8 => self.chat_deletion_dialog = None,
+            _ => {}
+        }
+    }
+
+    fn toggle_conversation_feature(&mut self, feature: ChatFeature) {
+        let Some(dialog) = &mut self.chat_deletion_dialog else {
+            return;
+        };
+        let Some(features) = &dialog.features else {
+            return;
+        };
+        let enabled = match feature {
+            ChatFeature::FullDeletion => !features.full_deletion,
+            ChatFeature::Reactions => !features.reactions,
+            ChatFeature::VoiceMessages => !features.voice_messages,
+            ChatFeature::FilesAndMedia => !features.files_and_media,
+        };
+        dialog.pending = true;
+        dialog.error = None;
+        let _ = self
+            .simplex_commands
+            .send(SimplexCommand::SetConversationFeature {
+                chat_ref: dialog.chat_ref.clone(),
+                feature,
+                enabled,
+            });
+    }
+
+    fn ask_chat_delete(&mut self, mode: ChatDeleteMode) {
+        let Some(dialog) = &self.chat_deletion_dialog else {
+            return;
+        };
+        if mode != ChatDeleteMode::Conversation && !dialog.chat_ref.0.starts_with('@') {
+            self.notice = Some("Contact actions are only available in direct chats".into());
+            return;
+        }
+        let chat_name = self
+            .chats
+            .iter()
+            .find(|chat| chat.chat_ref == dialog.chat_ref)
+            .map_or_else(|| "Chat".into(), |chat| chat.display_name.clone());
+        self.chat_delete_confirmation = Some(ChatDeleteConfirmation {
+            chat_ref: dialog.chat_ref.clone(),
+            chat_name,
+            mode,
+        });
+    }
+
+    fn confirm_chat_delete(&mut self) {
+        let Some(user_id) = self.active_user().map(|user| user.id) else {
+            return;
+        };
+        let Some(confirmation) = self.chat_delete_confirmation.take() else {
+            return;
+        };
+        if let Some(dialog) = &mut self.chat_deletion_dialog {
+            dialog.pending = true;
+            dialog.error = None;
+        }
+        let _ = self.simplex_commands.send(SimplexCommand::DeleteChat {
+            user_id,
+            chat_ref: confirmation.chat_ref,
+            mode: confirmation.mode,
         });
     }
 
@@ -1510,6 +1762,37 @@ mod tests {
         assert_eq!(chat_ref, ChatRef("@7".into()));
         assert_eq!(text, "a\nb");
         assert!(app.sending);
+    }
+
+    #[tokio::test]
+    async fn pasted_invitation_is_sent_as_a_typed_wrapper_command() {
+        let (commands, receiver) = mpsc::channel();
+        let mut app = App {
+            startup: StartupState::Ready(User {
+                id: 7,
+                display_name: "alice".into(),
+                notifications: true,
+                active: true,
+            }),
+            simplex_commands: commands,
+            ..App::default()
+        };
+
+        app.handle_key_events(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(app.input_mode, InputMode::ConnectInvitation);
+        app.handle_paste("  https://simplex.chat/contact#example\n".into());
+        app.handle_key_events(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+
+        let SimplexCommand::ConnectInvitation { user_id, link } = receiver.try_recv().unwrap()
+        else {
+            panic!("expected typed connect-invitation command")
+        };
+        assert_eq!(user_id, 7);
+        assert_eq!(link, "https://simplex.chat/contact#example");
+        assert!(app.connection_loading);
+        assert_eq!(app.input_mode, InputMode::None);
     }
 
     #[tokio::test]
@@ -1849,12 +2132,53 @@ mod tests {
                     chat_ref,
                     seconds,
                 } => break (user_id, chat_ref, seconds),
-                SimplexCommand::LoadChat(_) => {}
+                SimplexCommand::LoadChat(_) | SimplexCommand::LoadConversationFeatures { .. } => {}
                 command => panic!("unexpected command: {command:?}"),
             }
         };
         assert_eq!((user_id, changed, seconds), (3, chat_ref, Some(0)));
         assert!(app.chat_deletion_dialog.as_ref().unwrap().pending);
+    }
+
+    #[tokio::test]
+    async fn destructive_chat_actions_require_explicit_confirmation() {
+        let (commands, receiver) = mpsc::channel();
+        let confirmation = ChatDeleteConfirmation {
+            chat_ref: ChatRef("@7".into()),
+            chat_name: "bob".into(),
+            mode: ChatDeleteMode::BlockContact,
+        };
+        let mut app = App {
+            startup: StartupState::Ready(User {
+                id: 3,
+                display_name: "alice".into(),
+                notifications: true,
+                active: true,
+            }),
+            chat_delete_confirmation: Some(confirmation.clone()),
+            simplex_commands: commands,
+            ..App::default()
+        };
+
+        app.handle_key_events(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        assert!(app.chat_delete_confirmation.is_none());
+        assert!(receiver.try_recv().is_err());
+
+        app.chat_delete_confirmation = Some(confirmation);
+        app.handle_key_events(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))
+            .unwrap();
+        let SimplexCommand::DeleteChat {
+            user_id,
+            chat_ref,
+            mode,
+        } = receiver.try_recv().unwrap()
+        else {
+            panic!("expected typed chat-delete command")
+        };
+        assert_eq!(user_id, 3);
+        assert_eq!(chat_ref, ChatRef("@7".into()));
+        assert_eq!(mode, ChatDeleteMode::BlockContact);
     }
 
     #[tokio::test]
