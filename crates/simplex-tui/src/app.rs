@@ -1,22 +1,19 @@
-use std::sync::Arc;
 use std::{
     cell::{Cell, RefCell},
     collections::HashMap,
     io::{self, Write},
+    path::PathBuf,
     sync::mpsc,
 };
 
 use crate::event::{AppEvent, Event, EventHandler};
-use crate::{
-    chat::{
-        ChatDeletionSettings, ChatFeatures, ChatRef, ChatSummary, Message, Profile, ServerEntry,
-        ServerProtocol, SimplexEvent, User,
-    },
-    preferences::Preferences,
-    simplex::SimplexApi,
-    simplex_worker::{ChatFeature, SimplexCommand},
-};
+use crate::preferences::Preferences;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind};
+use libsimplex_rs::{
+    ChatDeletionSettings, ChatFeature, ChatFeatures, ChatRef, ChatSummary,
+    Command as SimplexCommand, Event as SimplexEvent, Message, Profile, ServerEntry,
+    ServerProtocol, Session, User,
+};
 use ratatui::{DefaultTerminal, layout::Rect};
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -105,6 +102,7 @@ pub struct App {
     pub input_mode: InputMode,
     pub input: String,
     pub notice: Option<String>,
+    data_directory: PathBuf,
     /// Last terminal area, used to translate mouse coordinates into UI actions.
     pub(crate) area: Cell<Rect>,
     pub(crate) composer_area: Cell<Rect>,
@@ -163,6 +161,7 @@ impl Default for App {
             input_mode: InputMode::None,
             input: String::new(),
             notice: None,
+            data_directory: PathBuf::new(),
             area: Cell::new(Rect::default()),
             composer_area: Cell::new(Rect::default()),
             send_area: Cell::new(Rect::default()),
@@ -198,21 +197,23 @@ impl App {
         "About",
     ];
 
-    pub fn new(api: Arc<SimplexApi>) -> Self {
-        let mut app = Self::default();
-        if let Ok(paths) = crate::simplex::SimplexPaths::discover() {
-            app.preferences = Preferences::load(&paths.root);
+    pub fn new(session: Session, data_directory: PathBuf) -> Self {
+        let (commands, events) = session.into_parts();
+        let preferences = Preferences::load(&data_directory);
+
+        Self {
+            preferences,
+            data_directory,
+            simplex_events: events,
+            simplex_commands: commands,
+            ..Self::default()
         }
-        let (sender, receiver) = mpsc::channel();
-        app.simplex_events = receiver;
-        app.simplex_commands = crate::simplex_worker::spawn(api, sender);
-        app
     }
 
     pub async fn run(mut self, mut terminal: DefaultTerminal) -> color_eyre::Result<()> {
         // This is the asynchronous bridge between the TUI and the synchronous
         // SimpleX/Haskell API. Ratatui renders the current `App` state here and
-        // Crossterm supplies terminal input, while `simplex_worker` owns the
+        // Crossterm supplies terminal input, while `libsimplex-rs` owns the
         // blocking FFI calls on a dedicated OS thread. The two sides communicate
         // exclusively through command/event channels: UI actions enqueue
         // `SimplexCommand`s, and periodic ticks project returned `SimplexEvent`s
@@ -1336,14 +1337,9 @@ impl App {
     }
 
     fn save_preferences(&mut self) {
-        match crate::simplex::SimplexPaths::discover().and_then(|paths| {
-            paths
-                .create()
-                .map_err(|_| crate::simplex::SimplexError::HomeDirectory)?;
-            self.preferences
-                .save(&paths.root)
-                .map_err(|_| crate::simplex::SimplexError::HomeDirectory)
-        }) {
+        let result = std::fs::create_dir_all(&self.data_directory)
+            .and_then(|()| self.preferences.save(&self.data_directory));
+        match result {
             Ok(()) => self.notice = Some("Setting saved".into()),
             Err(error) => self.notice = Some(format!("Could not save setting: {error}")),
         }
@@ -1386,7 +1382,7 @@ fn update_message_reaction(
             reaction.user_reacted = added;
         }
     } else if added {
-        message.reactions.push(crate::chat::MessageReaction {
+        message.reactions.push(libsimplex_rs::MessageReaction {
             emoji: emoji.to_owned(),
             count: 1,
             user_reacted: reacted_by_user,
@@ -1871,11 +1867,11 @@ mod tests {
                 timestamp: String::new(),
                 outgoing: false,
                 reactions: Vec::new(),
-                attachment: Some(crate::chat::Attachment {
+                attachment: Some(libsimplex_rs::Attachment {
                     id: 41,
                     name: "archive.zip".into(),
                     size: 100,
-                    kind: crate::chat::AttachmentKind::File,
+                    kind: libsimplex_rs::AttachmentKind::File,
                     status: "rcvTransfer".into(),
                     progress: Some(50),
                     path: None,

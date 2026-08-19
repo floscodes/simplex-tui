@@ -12,8 +12,8 @@ use tui_qrcode::{Colors, QrCodeWidget, Scaling};
 use unicode_width::UnicodeWidthStr;
 
 use crate::app::{App, InputMode, Section, StartupState};
-use crate::chat::{AttachmentKind, Message};
 use crate::preferences::Theme;
+use libsimplex_rs::{AttachmentKind, Message};
 
 const REACTION_EMOJIS: [&str; 8] = ["👍", "👎", "😀", "😂", "😢", "❤", "🚀", "✅"];
 

@@ -8,8 +8,9 @@ use std::{
 };
 
 use crate::{
-    chat::{self, ChatRef, ServerProtocol, SimplexEvent},
-    simplex::{SimplexApi, SimplexPaths},
+    Config,
+    ffi::{SimplexApi, SimplexPaths},
+    model::{self, ChatRef, ServerProtocol, SimplexEvent},
 };
 
 #[derive(Debug)]
@@ -77,17 +78,21 @@ pub enum ChatFeature {
 }
 
 struct DeletedProfileState {
-    profiles: Vec<chat::Profile>,
-    active_user: Option<chat::User>,
-    chats: Vec<chat::ChatSummary>,
+    profiles: Vec<model::Profile>,
+    active_user: Option<model::User>,
+    chats: Vec<model::ChatSummary>,
 }
 
-pub fn spawn(api: Arc<SimplexApi>, sender: Sender<SimplexEvent>) -> Sender<SimplexCommand> {
+pub fn spawn(
+    api: Arc<SimplexApi>,
+    config: Config,
+    sender: Sender<SimplexEvent>,
+) -> Sender<SimplexCommand> {
     let (command_sender, commands) = mpsc::channel();
     thread::Builder::new()
         .name("simplex-core".into())
         .spawn(move || {
-            if let Err(error) = run(&api, &sender, &commands) {
+            if let Err(error) = run(&api, &config, &sender, &commands) {
                 let _ = sender.send(SimplexEvent::Failed(error));
             }
         })
@@ -97,10 +102,11 @@ pub fn spawn(api: Arc<SimplexApi>, sender: Sender<SimplexEvent>) -> Sender<Simpl
 
 fn run(
     api: &Arc<SimplexApi>,
+    config: &Config,
     sender: &Sender<SimplexEvent>,
     commands: &Receiver<SimplexCommand>,
 ) -> Result<(), String> {
-    let paths = SimplexPaths::discover().map_err(|e| e.to_string())?;
+    let paths = SimplexPaths::at(&config.data_directory);
     paths
         .create()
         .map_err(|e| format!("cannot create {}: {e}", paths.root.display()))?;
@@ -116,12 +122,12 @@ fn run(
         .send(SimplexEvent::ProfilesLoaded(profiles))
         .map_err(|e| e.to_string())?;
 
-    let Some(user) = chat::active_user(&controller.command("/u").map_err(|e| e.to_string())?)?
+    let Some(user) = model::active_user(&controller.command("/u").map_err(|e| e.to_string())?)?
     else {
         sender
             .send(SimplexEvent::NoActiveUser)
             .map_err(|e| e.to_string())?;
-        return command_loop(controller, sender, commands);
+        return command_loop(controller, &config.download_directory, sender, commands);
     };
     controller.command("/_start").map_err(|e| e.to_string())?;
     send_auto_delete(&controller, sender, user.id)?;
@@ -132,11 +138,12 @@ fn run(
         .send(SimplexEvent::Ready { user, chats })
         .map_err(|e| e.to_string())?;
 
-    command_loop(controller, sender, commands)
+    command_loop(controller, &config.download_directory, sender, commands)
 }
 
 fn command_loop(
-    controller: crate::simplex::SimplexController,
+    controller: crate::ffi::SimplexController,
+    download_directory: &std::path::Path,
     sender: &Sender<SimplexEvent>,
     commands: &Receiver<SimplexCommand>,
 ) -> Result<(), String> {
@@ -148,7 +155,7 @@ fn command_loop(
                         controller.command(&format!("/_get chat {} count=100", requested_ref.0));
                     let event = match response
                         .map_err(|e| e.to_string())
-                        .and_then(|v| chat::chat_messages(&v))
+                        .and_then(|v| model::chat_messages(&v))
                     {
                         Ok((chat_ref, messages)) => SimplexEvent::ChatLoaded { chat_ref, messages },
                         Err(error) => SimplexEvent::ChatLoadFailed {
@@ -189,7 +196,7 @@ fn command_loop(
                                 .and_then(serde_json::Value::as_str)
                                 == Some("newChatItems") =>
                         {
-                            for (item_ref, message) in chat::new_messages(&response) {
+                            for (item_ref, message) in model::new_messages(&response) {
                                 sender
                                     .send(SimplexEvent::MessageReceived {
                                         chat_ref: item_ref,
@@ -224,7 +231,7 @@ fn command_loop(
                     send_reaction_change(sender, &response)?;
                 }
                 SimplexCommand::ReceiveFile { file_id, file_name } => {
-                    match receive_file(&controller, file_id, &file_name) {
+                    match receive_file(&controller, download_directory, file_id, &file_name) {
                         Ok((path, response)) => {
                             sender
                                 .send(SimplexEvent::FileDownloadStarted {
@@ -232,7 +239,7 @@ fn command_loop(
                                     path: path.to_string_lossy().into_owned(),
                                 })
                                 .map_err(|e| e.to_string())?;
-                            if let Some((chat_ref, message)) = chat::file_update(&response) {
+                            if let Some((chat_ref, message)) = model::file_update(&response) {
                                 sender
                                     .send(SimplexEvent::FileUpdated { chat_ref, message })
                                     .map_err(|e| e.to_string())?;
@@ -248,7 +255,7 @@ fn command_loop(
                         sender
                             .send(SimplexEvent::FileDownloadCancelled { file_id })
                             .map_err(|e| e.to_string())?;
-                        if let Some((chat_ref, message)) = chat::file_update(&response) {
+                        if let Some((chat_ref, message)) = model::file_update(&response) {
                             sender
                                 .send(SimplexEvent::FileUpdated { chat_ref, message })
                                 .map_err(|e| e.to_string())?;
@@ -263,7 +270,7 @@ fn command_loop(
                         let response = controller
                             .command(&format!("/_user {user_id}"))
                             .map_err(|e| e.to_string())?;
-                        let user = chat::active_user(&response)?
+                        let user = model::active_user(&response)?
                             .ok_or("SimpleX did not activate the selected profile")?;
                         controller.command("/_start").map_err(|e| e.to_string())?;
                         send_auto_delete(&controller, sender, user.id)?;
@@ -285,7 +292,7 @@ fn command_loop(
                         let response = controller
                             .command(&format!("/_create user {payload}"))
                             .map_err(|e| e.to_string())?;
-                        let user = chat::active_user(&response)?
+                        let user = model::active_user(&response)?
                             .ok_or("SimpleX did not create the profile")?;
                         controller.command("/_start").map_err(|e| e.to_string())?;
                         send_auto_delete(&controller, sender, user.id)?;
@@ -353,7 +360,7 @@ fn command_loop(
                     let event = controller
                         .command(&format!("/_connect {user_id} incognito=off"))
                         .map_err(|e| e.to_string())
-                        .and_then(|value| chat::invitation_link(&value))
+                        .and_then(|value| model::invitation_link(&value))
                         .map(SimplexEvent::InvitationCreated)
                         .unwrap_or_else(SimplexEvent::InvitationFailed);
                     sender.send(event).map_err(|e| e.to_string())?;
@@ -417,18 +424,18 @@ fn command_loop(
             .map_err(|e| e.to_string())?
         {
             send_reaction_change(sender, &value)?;
-            if let Some((chat_ref, message)) = chat::file_update(&value) {
+            if let Some((chat_ref, message)) = model::file_update(&value) {
                 sender
                     .send(SimplexEvent::FileUpdated { chat_ref, message })
                     .map_err(|e| e.to_string())?;
             }
-            if let Some((user_id, chat_ref)) = chat::connected_contact(&value) {
+            if let Some((user_id, chat_ref)) = model::connected_contact(&value) {
                 let chats = load_chats(&controller, user_id)?;
                 sender
                     .send(SimplexEvent::ContactConnected { chats, chat_ref })
                     .map_err(|e| e.to_string())?;
             }
-            for (chat_ref, message) in chat::new_messages(&value) {
+            for (chat_ref, message) in model::new_messages(&value) {
                 sender
                     .send(SimplexEvent::MessageReceived { chat_ref, message })
                     .map_err(|e| e.to_string())?;
@@ -438,23 +445,19 @@ fn command_loop(
 }
 
 fn receive_file(
-    controller: &crate::simplex::SimplexController,
+    controller: &crate::ffi::SimplexController,
+    directory: &std::path::Path,
     file_id: i64,
     file_name: &str,
 ) -> Result<(std::path::PathBuf, serde_json::Value), String> {
-    let user_dirs = directories::UserDirs::new().ok_or("could not locate user directories")?;
-    let directory = user_dirs
-        .download_dir()
-        .map(std::path::Path::to_path_buf)
-        .unwrap_or_else(|| user_dirs.home_dir().join("Downloads"));
-    std::fs::create_dir_all(&directory)
+    std::fs::create_dir_all(directory)
         .map_err(|error| format!("could not create {}: {error}", directory.display()))?;
     let safe_name = std::path::Path::new(file_name)
         .file_name()
         .and_then(std::ffi::OsStr::to_str)
         .filter(|name| !name.is_empty() && *name != "." && *name != "..")
         .unwrap_or("simplex-file");
-    let path = unused_download_path(&directory, safe_name);
+    let path = unused_download_path(directory, safe_name);
     let response = controller
         .command(&format!(
             "/freceive {file_id} approved_relays=on {}",
@@ -472,7 +475,7 @@ fn receive_file(
 }
 
 fn cancel_file(
-    controller: &crate::simplex::SimplexController,
+    controller: &crate::ffi::SimplexController,
     file_id: i64,
 ) -> Result<serde_json::Value, String> {
     let response = controller
@@ -515,7 +518,7 @@ fn send_reaction_change(
     sender: &Sender<SimplexEvent>,
     value: &serde_json::Value,
 ) -> Result<(), String> {
-    if let Some((chat_ref, item_id, emoji, added, user_reacted)) = chat::reaction_change(value) {
+    if let Some((chat_ref, item_id, emoji, added, user_reacted)) = model::reaction_change(value) {
         sender
             .send(SimplexEvent::ReactionChanged {
                 chat_ref,
@@ -530,7 +533,7 @@ fn send_reaction_change(
 }
 
 fn delete_profile(
-    controller: &crate::simplex::SimplexController,
+    controller: &crate::ffi::SimplexController,
     user_id: i64,
 ) -> Result<DeletedProfileState, String> {
     let profiles = load_profiles(controller)?;
@@ -542,14 +545,14 @@ fn delete_profile(
         let response = controller
             .command(&format!("/_user {}", other.id))
             .map_err(|e| e.to_string())?;
-        chat::active_user(&response)?.ok_or("SimpleX did not activate the replacement profile")?;
+        model::active_user(&response)?.ok_or("SimpleX did not activate the replacement profile")?;
     }
     let response = controller
         .command(&format!("/_delete user {user_id} del_smp=on"))
         .map_err(|e| e.to_string())?;
     ensure_ok(&response, "profile deletion")?;
     let profiles = load_profiles(controller)?;
-    let active_user = chat::active_user(&controller.command("/u").map_err(|e| e.to_string())?)?;
+    let active_user = model::active_user(&controller.command("/u").map_err(|e| e.to_string())?)?;
     let chats = if let Some(user) = &active_user {
         load_chats(controller, user.id)?
     } else {
@@ -563,7 +566,7 @@ fn delete_profile(
 }
 
 fn mark_chat_read(
-    controller: &crate::simplex::SimplexController,
+    controller: &crate::ffi::SimplexController,
     sender: &Sender<SimplexEvent>,
     chat_ref: &ChatRef,
 ) -> Result<(), String> {
@@ -577,13 +580,13 @@ fn mark_chat_read(
 }
 
 fn load_chat_features(
-    controller: &crate::simplex::SimplexController,
+    controller: &crate::ffi::SimplexController,
     sender: &Sender<SimplexEvent>,
     user_id: i64,
     enforce_calls_disabled: bool,
 ) -> Result<(), String> {
     let response = controller.command("/profile").map_err(|e| e.to_string())?;
-    let (mut profile, features) = chat::profile_and_features(&response)?;
+    let (mut profile, features) = model::profile_and_features(&response)?;
     if enforce_calls_disabled && preference_allow(&profile, "calls") != Some("no") {
         set_profile_preference(&mut profile, "calls", false)?;
         update_profile(controller, user_id, &profile)?;
@@ -594,13 +597,13 @@ fn load_chat_features(
 }
 
 fn update_chat_feature(
-    controller: &crate::simplex::SimplexController,
+    controller: &crate::ffi::SimplexController,
     user_id: i64,
     feature: ChatFeature,
     enabled: bool,
-) -> Result<chat::ChatFeatures, String> {
+) -> Result<model::ChatFeatures, String> {
     let response = controller.command("/profile").map_err(|e| e.to_string())?;
-    let (mut profile, _) = chat::profile_and_features(&response)?;
+    let (mut profile, _) = model::profile_and_features(&response)?;
     let name = match feature {
         ChatFeature::FullDeletion => "fullDelete",
         ChatFeature::Reactions => "reactions",
@@ -611,16 +614,16 @@ fn update_chat_feature(
     set_profile_preference(&mut profile, "calls", false)?;
     update_profile(controller, user_id, &profile)?;
     let synthetic = serde_json::json!({"result": {"type": "userProfile", "profile": profile}});
-    chat::profile_and_features(&synthetic).map(|(_, features)| features)
+    model::profile_and_features(&synthetic).map(|(_, features)| features)
 }
 
 fn update_global_deletion(
-    controller: &crate::simplex::SimplexController,
+    controller: &crate::ffi::SimplexController,
     user_id: i64,
     seconds: i64,
 ) -> Result<i64, String> {
     let response = controller.command("/profile").map_err(|e| e.to_string())?;
-    let (mut profile, _) = chat::profile_and_features(&response)?;
+    let (mut profile, _) = model::profile_and_features(&response)?;
     set_timed_preference(&mut profile, Some(seconds))?;
     set_profile_preference(&mut profile, "calls", false)?;
     update_profile(controller, user_id, &profile)?;
@@ -632,9 +635,9 @@ fn update_global_deletion(
 }
 
 fn load_chat_deletion(
-    controller: &crate::simplex::SimplexController,
+    controller: &crate::ffi::SimplexController,
     chat_ref: &ChatRef,
-) -> Result<chat::ChatDeletionSettings, String> {
+) -> Result<model::ChatDeletionSettings, String> {
     let response = controller
         .command(&format!("/_get chat {} count=1", chat_ref.0))
         .map_err(|e| e.to_string())?;
@@ -667,18 +670,18 @@ fn load_chat_deletion(
             .or(Some(0)),
         _ => None,
     };
-    Ok(chat::ChatDeletionSettings {
+    Ok(model::ChatDeletionSettings {
         local_ttl,
         disappearing_ttl,
     })
 }
 
 fn update_chat_deletion(
-    controller: &crate::simplex::SimplexController,
+    controller: &crate::ffi::SimplexController,
     user_id: i64,
     chat_ref: &ChatRef,
     seconds: Option<i64>,
-) -> Result<chat::ChatDeletionSettings, String> {
+) -> Result<model::ChatDeletionSettings, String> {
     let response = controller
         .command(&format!("/_get chat {} count=1", chat_ref.0))
         .map_err(|e| e.to_string())?;
@@ -821,7 +824,7 @@ fn set_profile_preference(
 }
 
 fn update_profile(
-    controller: &crate::simplex::SimplexController,
+    controller: &crate::ffi::SimplexController,
     user_id: i64,
     profile: &serde_json::Value,
 ) -> Result<(), String> {
@@ -832,7 +835,7 @@ fn update_profile(
 }
 
 fn send_servers(
-    controller: &crate::simplex::SimplexController,
+    controller: &crate::ffi::SimplexController,
     sender: &Sender<SimplexEvent>,
     user_id: i64,
 ) -> Result<(), String> {
@@ -843,17 +846,17 @@ fn send_servers(
 }
 
 fn load_servers(
-    controller: &crate::simplex::SimplexController,
+    controller: &crate::ffi::SimplexController,
     user_id: i64,
-) -> Result<Vec<chat::ServerEntry>, String> {
+) -> Result<Vec<model::ServerEntry>, String> {
     let response = controller
         .command(&format!("/_servers {user_id}"))
         .map_err(|e| e.to_string())?;
-    chat::server_entries(&response)
+    model::server_entries(&response)
 }
 
 fn user_servers_json(
-    controller: &crate::simplex::SimplexController,
+    controller: &crate::ffi::SimplexController,
     user_id: i64,
 ) -> Result<serde_json::Value, String> {
     let response = controller
@@ -866,7 +869,7 @@ fn user_servers_json(
 }
 
 fn save_user_servers(
-    controller: &crate::simplex::SimplexController,
+    controller: &crate::ffi::SimplexController,
     user_id: i64,
     servers: &serde_json::Value,
 ) -> Result<(), String> {
@@ -877,7 +880,7 @@ fn save_user_servers(
 }
 
 fn set_server_enabled(
-    controller: &crate::simplex::SimplexController,
+    controller: &crate::ffi::SimplexController,
     user_id: i64,
     protocol: ServerProtocol,
     address: &str,
@@ -911,7 +914,7 @@ fn set_server_enabled(
 }
 
 fn add_server(
-    controller: &crate::simplex::SimplexController,
+    controller: &crate::ffi::SimplexController,
     user_id: i64,
     protocol: ServerProtocol,
     address: &str,
@@ -961,16 +964,16 @@ fn add_server(
 }
 
 fn load_profiles(
-    controller: &crate::simplex::SimplexController,
-) -> Result<Vec<chat::Profile>, String> {
-    chat::profiles(&controller.command("/users").map_err(|e| e.to_string())?)
+    controller: &crate::ffi::SimplexController,
+) -> Result<Vec<model::Profile>, String> {
+    model::profiles(&controller.command("/users").map_err(|e| e.to_string())?)
 }
 
 fn load_chats(
-    controller: &crate::simplex::SimplexController,
+    controller: &crate::ffi::SimplexController,
     user_id: i64,
-) -> Result<Vec<chat::ChatSummary>, String> {
-    chat::chats(
+) -> Result<Vec<model::ChatSummary>, String> {
+    model::chats(
         &controller
             .command(&format!("/_get chats {user_id} pcc=on"))
             .map_err(|e| e.to_string())?,
@@ -991,7 +994,7 @@ fn ensure_ok(value: &serde_json::Value, operation: &str) -> Result<(), String> {
 }
 
 fn send_auto_delete(
-    controller: &crate::simplex::SimplexController,
+    controller: &crate::ffi::SimplexController,
     sender: &Sender<SimplexEvent>,
     user_id: i64,
 ) -> Result<(), String> {

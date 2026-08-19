@@ -4,50 +4,46 @@ use crossterm::event::{
     PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
+use directories::{BaseDirs, UserDirs};
+use libsimplex_rs::{Client, Config};
 use std::io::stdout;
-use std::{path::PathBuf, sync::Arc};
 
 pub mod app;
-pub mod chat;
 pub mod event;
 pub mod preferences;
-pub mod simplex;
-pub mod simplex_worker;
 pub mod ui;
-
-#[cfg(target_os = "linux")]
-const SIMPLEX_LIBRARY_NAME: &str = "libsimplex.so";
-#[cfg(target_os = "macos")]
-const SIMPLEX_LIBRARY_NAME: &str = "libsimplex.dylib";
-#[cfg(target_os = "windows")]
-const SIMPLEX_LIBRARY_NAME: &str = "libsimplex.dll";
 
 fn main() -> color_eyre::Result<()> {
     color_eyre::install()?;
-    let library_path = std::env::var_os("SIMPLEX_CHAT_LIB")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("vendor/libsimplex")
-                .join(SIMPLEX_LIBRARY_NAME)
-        });
     // Initialize the GHC runtime on the process main thread, before Tokio
     // creates any worker threads. The bootstrap script pins the matching ABI.
-    let api = unsafe { simplex::SimplexApi::load(library_path) }?;
+    let client = match std::env::var_os("SIMPLEX_CHAT_LIB") {
+        Some(path) => Client::load(path)?,
+        None => Client::load_bundled()?,
+    };
+    let base_dirs = BaseDirs::new().ok_or_else(|| color_eyre::eyre::eyre!("no home directory"))?;
+    let data_directory = base_dirs.home_dir().join(".simplex-tui");
+    let download_directory = UserDirs::new()
+        .and_then(|dirs| dirs.download_dir().map(std::path::Path::to_path_buf))
+        .unwrap_or_else(|| base_dirs.home_dir().join("Downloads"));
+    let session = client.start(Config::new(&data_directory, download_directory));
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?
-        .block_on(run(api))
+        .block_on(run(session, data_directory))
 }
 
-async fn run(api: Arc<simplex::SimplexApi>) -> color_eyre::Result<()> {
+async fn run(
+    session: libsimplex_rs::Session,
+    data_directory: std::path::PathBuf,
+) -> color_eyre::Result<()> {
     let terminal = ratatui::init();
     execute!(
         stdout(),
         EnableMouseCapture,
         PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
     )?;
-    let result = App::new(api).run(terminal).await;
+    let result = App::new(session, data_directory).run(terminal).await;
     let input_result = execute!(stdout(), PopKeyboardEnhancementFlags, DisableMouseCapture);
     ratatui::restore();
     input_result?;

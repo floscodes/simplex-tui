@@ -5,10 +5,14 @@ use std::{
 };
 
 fn main() {
+    println!("cargo::rerun-if-env-changed=CARGO_FEATURE_BUNDLED");
+    if env::var_os("CARGO_FEATURE_BUNDLED").is_none() {
+        return;
+    }
     for script in [
-        "scripts/bootstrap-simplex.sh",
-        "scripts/bootstrap-simplex-macos.sh",
-        "scripts/bootstrap-simplex-windows.ps1",
+        "../../scripts/bootstrap-simplex.sh",
+        "../../scripts/bootstrap-simplex-macos.sh",
+        "../../scripts/bootstrap-simplex-windows.ps1",
     ] {
         println!("cargo::rerun-if-changed={script}");
     }
@@ -20,8 +24,9 @@ fn main() {
         return;
     }
 
-    let root =
+    let manifest =
         PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("missing CARGO_MANIFEST_DIR"));
+    let root = manifest.join("../..");
     let host = env::var("HOST").expect("missing HOST");
     let target = env::var("TARGET").expect("missing TARGET");
     if host != target {

@@ -1,0 +1,22 @@
+[package]
+name = "libsimplex-rs"
+version = "0.1.0"
+description = "Safe Rust client wrapper for the official SimpleX Chat library"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+publish = false
+build = "build.rs"
+
+[features]
+default = []
+bundled = []
+
+[dependencies]
+libc = "0.2.177"
+libloading = "0.8.9"
+serde_json = "1.0.145"
+thiserror = "2.0.17"
+
+[dev-dependencies]
+tempfile = "3.23.0"

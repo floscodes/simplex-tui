@@ -765,6 +765,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "libsimplex-rs"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "libloading",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "line-clipping"
 version = "0.3.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1484,14 +1495,12 @@ dependencies = [
  "crossterm",
  "directories",
  "futures",
- "libc",
- "libloading",
+ "libsimplex-rs",
  "qrcode",
  "ratatui",
  "serde",
  "serde_json",
  "tempfile",
- "thiserror 2.0.20",
  "tokio",
  "tui-qrcode",
  "unicode-width",

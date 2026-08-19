@@ -13,7 +13,6 @@ use std::{
     time::Duration,
 };
 
-use directories::BaseDirs;
 use libloading::Library;
 use serde_json::Value;
 use thiserror::Error;
@@ -22,6 +21,7 @@ type ChatCtrl = *mut c_void;
 type HsInit = unsafe extern "C" fn(*mut c_int, *mut *mut *mut c_char);
 type ChatMigrateInit =
     unsafe extern "C" fn(*const c_char, *const c_char, *const c_char, *mut ChatCtrl) -> *mut c_char;
+#[cfg(test)]
 type ChatCtrlCall = unsafe extern "C" fn(ChatCtrl) -> *mut c_char;
 type ChatSendCmd = unsafe extern "C" fn(ChatCtrl, *const c_char) -> *mut c_char;
 type ChatRecvWait = unsafe extern "C" fn(ChatCtrl, c_int) -> *mut c_char;
@@ -30,8 +30,6 @@ static HASKELL_RUNTIME: OnceLock<()> = OnceLock::new();
 
 #[derive(Debug, Error)]
 pub enum SimplexError {
-    #[error("could not locate the user's home directory")]
-    HomeDirectory,
     #[error("could not load SimpleX library {path}: {source}")]
     LoadLibrary {
         path: PathBuf,
@@ -66,14 +64,6 @@ pub struct SimplexPaths {
 }
 
 impl SimplexPaths {
-    pub fn discover() -> Result<Self, SimplexError> {
-        let root = BaseDirs::new()
-            .ok_or(SimplexError::HomeDirectory)?
-            .home_dir()
-            .join(".simplex-tui");
-        Ok(Self::at(root))
-    }
-
     pub fn at(root: impl Into<PathBuf>) -> Self {
         let root = root.into();
         let database_prefix = root.join("simplex");
@@ -96,8 +86,8 @@ impl SimplexPaths {
 
 struct Symbols {
     migrate_init: ChatMigrateInit,
+    #[cfg(test)]
     close_store: ChatCtrlCall,
-    reopen_store: ChatCtrlCall,
     send_cmd: ChatSendCmd,
     recv_wait: ChatRecvWait,
 }
@@ -141,8 +131,8 @@ impl SimplexApi {
             unsafe { symbol(&library, b"hs_init_with_rtsopts\0", "hs_init_with_rtsopts")? };
         let symbols = Symbols {
             migrate_init: unsafe { symbol(&library, b"chat_migrate_init\0", "chat_migrate_init")? },
+            #[cfg(test)]
             close_store: unsafe { symbol(&library, b"chat_close_store\0", "chat_close_store")? },
-            reopen_store: unsafe { symbol(&library, b"chat_reopen_store\0", "chat_reopen_store")? },
             send_cmd: unsafe { symbol(&library, b"chat_send_cmd\0", "chat_send_cmd")? },
             recv_wait: unsafe { symbol(&library, b"chat_recv_msg_wait\0", "chat_recv_msg_wait")? },
         };
@@ -260,14 +250,12 @@ impl SimplexController {
         }
     }
 
+    #[cfg(test)]
     pub fn close_store(&self) -> Result<String, SimplexError> {
         self.store_call(self.api.symbols.close_store, "chat_close_store")
     }
 
-    pub fn reopen_store(&self) -> Result<String, SimplexError> {
-        self.store_call(self.api.symbols.reopen_store, "chat_reopen_store")
-    }
-
+    #[cfg(test)]
     fn store_call(&self, call: ChatCtrlCall, name: &'static str) -> Result<String, SimplexError> {
         let ctrl = *self
             .raw
@@ -344,7 +332,7 @@ mod tests {
     fn loads_official_haskell_runtime() {
         let library = std::env::var_os("SIMPLEX_LIBRARY")
             .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("vendor/libsimplex/libsimplex.so"));
+            .unwrap_or_else(crate::bundled_library_path);
         // SAFETY: this test explicitly targets the pinned library built by our bootstrap script.
         let api = unsafe { SimplexApi::load(library) };
         assert!(api.is_ok(), "{:#}", api.err().expect("error exists"));
@@ -355,7 +343,7 @@ mod tests {
     fn opens_database_and_calls_chat_api() {
         let library = std::env::var_os("SIMPLEX_LIBRARY")
             .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("vendor/libsimplex/libsimplex.so"));
+            .unwrap_or_else(crate::bundled_library_path);
         // SAFETY: this test explicitly targets the pinned library built by our bootstrap script.
         let api = unsafe { SimplexApi::load(library) }.expect("load SimpleX library");
         let temp = tempfile::tempdir().expect("create temporary data directory");
@@ -370,7 +358,7 @@ mod tests {
     #[test]
     #[ignore = "requires the separately built official Haskell library"]
     fn creates_lists_and_activates_profile() {
-        let library = PathBuf::from("vendor/libsimplex/libsimplex.so");
+        let library = crate::bundled_library_path();
         // SAFETY: this test explicitly targets the pinned library built by our bootstrap script.
         let api = unsafe { SimplexApi::load(library) }.expect("load SimpleX library");
         let temp = tempfile::tempdir().expect("create temporary data directory");

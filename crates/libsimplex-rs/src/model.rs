@@ -212,6 +212,7 @@ pub fn invitation_link(value: &Value) -> Result<String, String> {
     Ok(link.to_owned())
 }
 
+#[cfg(test)]
 pub fn smp_servers(value: &Value) -> Result<Vec<String>, String> {
     let result = value
         .get("result")
@@ -331,6 +332,7 @@ pub fn reaction_change(value: &Value) -> Option<(ChatRef, i64, String, bool, boo
     ))
 }
 
+#[cfg(test)]
 fn collect_smp_servers(value: &Value, servers: &mut Vec<String>) {
     match value {
         Value::String(server) if server.starts_with("smp://") => servers.push(server.clone()),
