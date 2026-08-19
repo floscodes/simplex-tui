@@ -56,13 +56,15 @@ This checks out the recorded stable SimpleX Chat revision under
 a typed `Session`. Application data lives exclusively under `~/.simplex-tui`;
 there is no user-editable configuration file.
 
-The upstream SimpleX sources and linked library are AGPL-3.0 licensed. Review
-the distribution obligations before shipping binaries.
+The upstream SimpleX sources, the linked library, and both Rust crates in this
+workspace are licensed under AGPL-3.0-only. Vendored dependencies retain their
+respective licenses.
 
 ## License
 
 Copyright (c) floscodes <mail@floscodes.net>
 
-This project is licensed under the MIT license ([LICENSE] or <http://opensource.org/licenses/MIT>)
+This project, including the `simplex-tui` and `libsimplex-rs` crates, is
+licensed under [GNU AGPL v3 only].
 
-[LICENSE]: ./LICENSE
+[GNU AGPL v3 only]: ./LICENSE
