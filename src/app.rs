@@ -1111,6 +1111,10 @@ impl App {
             .collect()
     }
 
+    pub fn total_unread(&self) -> u64 {
+        self.chats.iter().map(|chat| chat.unread_count).sum()
+    }
+
     fn toggle_selected_server(&mut self) {
         let Some(user_id) = self.active_user().map(|user| user.id) else {
             self.notice = Some("Create a profile first".into());
@@ -1952,5 +1956,25 @@ mod tests {
         };
         assert_eq!((user_id, protocol), (3, ServerProtocol::Xftp));
         assert_eq!(address, "xftp://key@files.example");
+    }
+
+    #[tokio::test]
+    async fn total_unread_sums_all_conversations() {
+        let app = App {
+            chats: vec![
+                ChatSummary {
+                    chat_ref: ChatRef("@1".into()),
+                    display_name: "alice".into(),
+                    unread_count: 2,
+                },
+                ChatSummary {
+                    chat_ref: ChatRef("@2".into()),
+                    display_name: "bob".into(),
+                    unread_count: 3,
+                },
+            ],
+            ..App::default()
+        };
+        assert_eq!(app.total_unread(), 5);
     }
 }

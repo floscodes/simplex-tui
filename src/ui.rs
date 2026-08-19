@@ -79,18 +79,34 @@ fn panel(title: &str) -> Block<'_> {
 }
 
 fn render_tabs(app: &App, area: Rect, buf: &mut Buffer) {
-    Tabs::new([" Chats ", " Profiles ", " Settings "])
+    let unread = app.total_unread();
+    let chats = if unread == 0 {
+        Line::from(" Chats ")
+    } else {
+        Line::from(Span::styled(
+            format!(" Chats ({unread}) "),
+            Style::default()
+                .fg(Color::LightBlue)
+                .add_modifier(Modifier::BOLD),
+        ))
+    };
+    let selected_style = if app.section == Section::Chats && unread > 0 {
+        Style::default()
+            .fg(Color::LightBlue)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD)
+    };
+    Tabs::new([chats, Line::from(" Profiles "), Line::from(" Settings ")])
         .select(match app.section {
             Section::Chats => 0,
             Section::Profiles => 1,
             Section::Settings => 2,
         })
         .divider("│")
-        .highlight_style(
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        )
+        .highlight_style(selected_style)
         .block(
             Block::default()
                 .borders(Borders::ALL)
@@ -728,10 +744,10 @@ fn message_display_text(message: &Message) -> String {
         String::new()
     } else {
         match attachment.status.as_str() {
-            "rcvAccepted" => "  ○  ⏹ Stop".into(),
+            "rcvAccepted" => "  => 0%  ⏹ Stop".into(),
             "rcvTransfer" => format!(
                 "  {}  ⏹ Stop",
-                circular_progress(attachment.progress.unwrap_or(0))
+                download_progress(attachment.progress.unwrap_or(0))
             ),
             "rcvComplete" => "  ✓".into(),
             _ => "  ↓".into(),
@@ -745,14 +761,10 @@ fn message_display_text(message: &Message) -> String {
     }
 }
 
-fn circular_progress(percent: u8) -> char {
-    match percent {
-        0..=12 => '○',
-        13..=37 => '◔',
-        38..=62 => '◑',
-        63..=87 => '◕',
-        _ => '●',
-    }
+fn download_progress(percent: u8) -> String {
+    let percent = percent.min(100);
+    let length = usize::from(percent).saturating_mul(12).div_ceil(100).max(1);
+    format!("{}> {percent}%", "=".repeat(length))
 }
 
 fn render_reaction_picker(app: &App, screen: Rect, buf: &mut Buffer) {
