@@ -5,10 +5,6 @@ use std::{
 };
 
 fn main() {
-    println!("cargo::rerun-if-env-changed=CARGO_FEATURE_BUNDLED");
-    if env::var_os("CARGO_FEATURE_BUNDLED").is_none() {
-        return;
-    }
     for script in [
         "../../scripts/bootstrap-simplex.sh",
         "../../scripts/bootstrap-simplex-macos.sh",

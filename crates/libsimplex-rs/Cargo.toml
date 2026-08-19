@@ -2,15 +2,17 @@
 name = "libsimplex-rs"
 version = "0.1.0"
 description = "Safe Rust client wrapper for the official SimpleX Chat library"
+readme = "README.md"
+repository = "https://github.com/floscodes/simplex-tui"
+homepage = "https://github.com/floscodes/simplex-tui"
+documentation = "https://docs.rs/libsimplex-rs"
+keywords = ["simplex", "chat", "messaging", "ffi", "wrapper"]
+categories = ["api-bindings", "network-programming"]
+rust-version = "1.85"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
-publish = false
-build = "build.rs"
-
-[features]
-default = []
-bundled = []
+include = ["src/**", "Cargo.toml", "README.md"]
 
 [dependencies]
 libc = "0.2.177"

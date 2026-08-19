@@ -19,7 +19,7 @@ fn main() -> color_eyre::Result<()> {
     // creates any worker threads. The bootstrap script pins the matching ABI.
     let client = match std::env::var_os("SIMPLEX_CHAT_LIB") {
         Some(path) => Client::load(path)?,
-        None => Client::load_bundled()?,
+        None => Client::load(bundled_library_path())?,
     };
     let base_dirs = BaseDirs::new().ok_or_else(|| color_eyre::eyre::eyre!("no home directory"))?;
     let data_directory = base_dirs.home_dir().join(".simplex-tui");
@@ -31,6 +31,20 @@ fn main() -> color_eyre::Result<()> {
         .enable_all()
         .build()?
         .block_on(run(session, data_directory))
+}
+
+fn bundled_library_path() -> std::path::PathBuf {
+    let name = if cfg!(target_os = "linux") {
+        "libsimplex.so"
+    } else if cfg!(target_os = "macos") {
+        "libsimplex.dylib"
+    } else {
+        "libsimplex.dll"
+    };
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join("vendor/libsimplex")
+        .join(name)
 }
 
 async fn run(

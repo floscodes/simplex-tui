@@ -47,11 +47,6 @@ impl Client {
         Ok(Self { api })
     }
 
-    /// Load the native library produced by this workspace's bundled bootstrap.
-    pub fn load_bundled() -> Result<Self, Error> {
-        Self::load(bundled_library_path())
-    }
-
     /// Start the serialized SimpleX controller and its typed command/event bridge.
     pub fn start(self, config: Config) -> Session {
         let (event_sender, events) = mpsc::channel();
@@ -70,18 +65,4 @@ impl Session {
     pub fn into_parts(self) -> (mpsc::Sender<Command>, mpsc::Receiver<Event>) {
         (self.commands, self.events)
     }
-}
-
-pub fn bundled_library_path() -> std::path::PathBuf {
-    let name = if cfg!(target_os = "linux") {
-        "libsimplex.so"
-    } else if cfg!(target_os = "macos") {
-        "libsimplex.dylib"
-    } else {
-        "libsimplex.dll"
-    };
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
-        .join("vendor/libsimplex")
-        .join(name)
 }

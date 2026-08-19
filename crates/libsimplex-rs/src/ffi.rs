@@ -318,6 +318,20 @@ unsafe fn take_optional_json(
 mod tests {
     use super::*;
 
+    fn bundled_library_path() -> PathBuf {
+        let name = if cfg!(target_os = "linux") {
+            "libsimplex.so"
+        } else if cfg!(target_os = "macos") {
+            "libsimplex.dylib"
+        } else {
+            "libsimplex.dll"
+        };
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join("vendor/libsimplex")
+            .join(name)
+    }
+
     #[test]
     fn app_data_lives_under_one_root() {
         let paths = SimplexPaths::at("/tmp/example-home/.simplex-tui");
@@ -332,7 +346,7 @@ mod tests {
     fn loads_official_haskell_runtime() {
         let library = std::env::var_os("SIMPLEX_LIBRARY")
             .map(PathBuf::from)
-            .unwrap_or_else(crate::bundled_library_path);
+            .unwrap_or_else(bundled_library_path);
         // SAFETY: this test explicitly targets the pinned library built by our bootstrap script.
         let api = unsafe { SimplexApi::load(library) };
         assert!(api.is_ok(), "{:#}", api.err().expect("error exists"));
@@ -343,7 +357,7 @@ mod tests {
     fn opens_database_and_calls_chat_api() {
         let library = std::env::var_os("SIMPLEX_LIBRARY")
             .map(PathBuf::from)
-            .unwrap_or_else(crate::bundled_library_path);
+            .unwrap_or_else(bundled_library_path);
         // SAFETY: this test explicitly targets the pinned library built by our bootstrap script.
         let api = unsafe { SimplexApi::load(library) }.expect("load SimpleX library");
         let temp = tempfile::tempdir().expect("create temporary data directory");
@@ -358,7 +372,7 @@ mod tests {
     #[test]
     #[ignore = "requires the separately built official Haskell library"]
     fn creates_lists_and_activates_profile() {
-        let library = crate::bundled_library_path();
+        let library = bundled_library_path();
         // SAFETY: this test explicitly targets the pinned library built by our bootstrap script.
         let api = unsafe { SimplexApi::load(library) }.expect("load SimpleX library");
         let temp = tempfile::tempdir().expect("create temporary data directory");
