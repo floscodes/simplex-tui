@@ -381,9 +381,16 @@ mod tests {
             .expect("initialize SimpleX database");
         let created = controller
             .command(
-                "/_create user {\"profile\":{\"displayName\":\"Test User\",\"fullName\":\"\"},\"pastTimestamp\":false}",
+                "/_create user {\"profile\":{\"displayName\":\"Test User Private\",\"fullName\":\"Test User (Private)\"},\"pastTimestamp\":false}",
             )
             .expect("create profile");
+        assert_eq!(
+            crate::model::active_user(&created)
+                .expect("parse created user")
+                .expect("created active user")
+                .display_name,
+            "Test User (Private)"
+        );
         let user_id = created
             .pointer("/result/user/userId")
             .and_then(Value::as_i64)

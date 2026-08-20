@@ -35,6 +35,10 @@ pub enum SimplexCommand {
     },
     ActivateProfile(i64),
     CreateProfile(String),
+    RenameProfile {
+        user_id: i64,
+        display_name: String,
+    },
     DeleteProfile(i64),
     SetAutoDelete {
         user_id: i64,
@@ -309,9 +313,16 @@ fn command_loop(
                 }
                 SimplexCommand::CreateProfile(name) => {
                     let result = (|| {
-                        let escaped = serde_json::to_string(&name).map_err(|e| e.to_string())?;
+                        let display_name = simplex_display_name(&name);
+                        if display_name.is_empty() {
+                            return Err("profile name cannot be empty".into());
+                        }
+                        let escaped_display_name =
+                            serde_json::to_string(&display_name).map_err(|e| e.to_string())?;
+                        let escaped_full_name =
+                            serde_json::to_string(name.trim()).map_err(|e| e.to_string())?;
                         let payload = format!(
-                            "{{\"profile\":{{\"displayName\":{escaped},\"fullName\":\"\"}},\"pastTimestamp\":false}}"
+                            "{{\"profile\":{{\"displayName\":{escaped_display_name},\"fullName\":{escaped_full_name}}},\"pastTimestamp\":false}}"
                         );
                         let response = controller
                             .command(&format!("/_create user {payload}"))
@@ -331,8 +342,20 @@ fn command_loop(
                         })
                     })();
                     sender
-                        .send(result.unwrap_or_else(SimplexEvent::Failed))
+                        .send(result.unwrap_or_else(SimplexEvent::ProfileCreateFailed))
                         .map_err(|e| e.to_string())?;
+                }
+                SimplexCommand::RenameProfile {
+                    user_id,
+                    display_name,
+                } => {
+                    let event = rename_profile(&controller, user_id, &display_name)
+                        .map(|(profiles, active_user)| SimplexEvent::ProfileRenamed {
+                            profiles,
+                            active_user,
+                        })
+                        .unwrap_or_else(SimplexEvent::ProfileRenameFailed);
+                    sender.send(event).map_err(|e| e.to_string())?;
                 }
                 SimplexCommand::DeleteProfile(user_id) => {
                     let result = delete_profile(&controller, user_id);
@@ -1206,6 +1229,61 @@ fn load_profiles(
     controller: &crate::ffi::SimplexController,
 ) -> Result<Vec<model::Profile>, String> {
     model::profiles(&controller.command("/users").map_err(|e| e.to_string())?)
+}
+
+fn rename_profile(
+    controller: &crate::ffi::SimplexController,
+    user_id: i64,
+    display_name: &str,
+) -> Result<(Vec<model::Profile>, Option<model::User>), String> {
+    let full_name = display_name.trim();
+    let display_name = simplex_display_name(full_name);
+    if display_name.is_empty() {
+        return Err("profile name cannot be empty".into());
+    }
+    let users = controller.command("/users").map_err(|e| e.to_string())?;
+    let user = users
+        .pointer("/result/users")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|users| {
+            users.iter().find_map(|entry| {
+                let user = entry.get("user")?;
+                (user.get("userId").and_then(serde_json::Value::as_i64) == Some(user_id))
+                    .then_some(user)
+            })
+        })
+        .ok_or("selected profile no longer exists")?;
+    let mut profile = user
+        .get("profile")
+        .cloned()
+        .ok_or("selected user has no profile")?;
+    profile
+        .as_object_mut()
+        .ok_or("profile is not an object")?
+        .insert("displayName".into(), display_name.into());
+    profile
+        .as_object_mut()
+        .ok_or("profile is not an object")?
+        .insert("fullName".into(), full_name.into());
+    update_profile(controller, user_id, &profile)?;
+    let profiles = load_profiles(controller)?;
+    let active_user = model::active_user(&controller.command("/u").map_err(|e| e.to_string())?)?;
+    Ok((profiles, active_user))
+}
+
+/// SimpleX permits spaces in `displayName`, but reserves round brackets.
+/// Preserve the user's exact label in `fullName` and use this protocol-safe
+/// form as the locally unique display name.
+fn simplex_display_name(name: &str) -> String {
+    name.chars()
+        .map(|character| match character {
+            '(' | ')' => ' ',
+            character => character,
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn load_chats(

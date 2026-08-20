@@ -212,7 +212,11 @@ fn render_profile(app: &App, area: Rect, buf: &mut Buffer) {
             input.push('▏');
         }
         let hint = if app.input_mode == InputMode::CreateProfile {
-            "Enter: create · Esc: cancel"
+            if app.profile_create_pending {
+                "Creating profile…"
+            } else {
+                "Enter: create · Esc: cancel"
+            }
         } else {
             "Press Enter or n to start"
         };
@@ -225,8 +229,18 @@ fn render_profile(app: &App, area: Rect, buf: &mut Buffer) {
         return;
     }
     let profile = &app.profiles[app.selected_profile];
+    if app.input_mode == InputMode::RenameProfile {
+        Paragraph::new(format!(
+            "Rename SimpleX profile\n\nDisplay name\n{}▏\n\nEnter: save · Esc: cancel",
+            app.input
+        ))
+        .block(panel("Rename profile").padding(Padding::new(2, 2, 1, 1)))
+        .wrap(Wrap { trim: false })
+        .render(area, buf);
+        return;
+    }
     Paragraph::new(format!(
-        "Display name\n{}\n\nStatus\n{}\n\nEnter: activate · n: new profile · d: delete",
+        "Display name\n{}\n\nStatus\n{}\n\nEnter: activate · r: rename · n: new profile · d: delete",
         profile.display_name,
         if profile.active { "Active" } else { "Inactive" },
     ))

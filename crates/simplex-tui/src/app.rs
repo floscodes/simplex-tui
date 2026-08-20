@@ -37,6 +37,7 @@ pub enum InputMode {
     #[default]
     None,
     CreateProfile,
+    RenameProfile,
     ConfirmDeleteProfile,
     AddServer,
     ConnectInvitation,
@@ -113,6 +114,7 @@ pub struct App {
     pub connection_error: Option<String>,
     pub input_mode: InputMode,
     pub input: String,
+    pub profile_create_pending: bool,
     pub notice: Option<String>,
     data_directory: PathBuf,
     /// Last terminal area, used to translate mouse coordinates into UI actions.
@@ -176,6 +178,7 @@ impl Default for App {
             connection_error: None,
             input_mode: InputMode::None,
             input: String::new(),
+            profile_create_pending: false,
             notice: None,
             data_directory: PathBuf::new(),
             area: Cell::new(Rect::default()),
@@ -293,6 +296,9 @@ impl App {
             return Ok(());
         }
         if self.input_mode == InputMode::CreateProfile {
+            if self.profile_create_pending {
+                return Ok(());
+            }
             match key.code {
                 KeyCode::Esc => {
                     self.input_mode = InputMode::None;
@@ -300,18 +306,34 @@ impl App {
                 }
                 KeyCode::Enter if !self.input.trim().is_empty() => {
                     let name = self.input.trim().to_owned();
+                    self.notice = Some("Creating profile…".into());
+                    self.profile_create_pending = true;
+                    if self
+                        .simplex_commands
+                        .send(SimplexCommand::CreateProfile(name))
+                        .is_err()
+                    {
+                        self.profile_create_pending = false;
+                        self.notice = Some("SimpleX worker is not available".into());
+                    }
+                }
+                KeyCode::Backspace => {
+                    self.input.pop();
+                }
+                KeyCode::Char(character) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.input.push(character)
+                }
+                _ => {}
+            }
+            return Ok(());
+        }
+        if self.input_mode == InputMode::RenameProfile {
+            match key.code {
+                KeyCode::Esc => {
                     self.input_mode = InputMode::None;
                     self.input.clear();
-                    self.notice = Some("Creating profile…".into());
-                    self.startup = StartupState::Loading;
-                    self.chats.clear();
-                    self.messages.clear();
-                    self.message_cache.clear();
-                    self.loaded_chat = None;
-                    let _ = self
-                        .simplex_commands
-                        .send(SimplexCommand::CreateProfile(name));
                 }
+                KeyCode::Enter if !self.input.trim().is_empty() => self.rename_profile(),
                 KeyCode::Backspace => {
                     self.input.pop();
                 }
@@ -386,6 +408,24 @@ impl App {
             }
             return Ok(());
         }
+        // The final Profiles row is the create-profile editor itself.  Start
+        // editing as soon as the user types, instead of silently discarding
+        // the first name characters until Enter or `n` was pressed.
+        if self.section == Section::Profiles && self.selected_profile >= self.profiles.len() {
+            match key.code {
+                KeyCode::Enter => {
+                    self.input_mode = InputMode::CreateProfile;
+                    self.input.clear();
+                }
+                KeyCode::Char(character) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.input_mode = InputMode::CreateProfile;
+                    self.input.clear();
+                    self.input.push(character);
+                }
+                _ => {}
+            }
+            return Ok(());
+        }
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') => self.events.send(AppEvent::Quit),
             KeyCode::Char('n') if self.section == Section::Chats => self.show_invitation(),
@@ -416,6 +456,13 @@ impl App {
             KeyCode::Char('n') if self.section == Section::Profiles => {
                 self.input_mode = InputMode::CreateProfile;
                 self.input.clear();
+            }
+            KeyCode::Char('r')
+                if self.section == Section::Profiles
+                    && self.selected_profile < self.profiles.len() =>
+            {
+                self.input_mode = InputMode::RenameProfile;
+                self.input = self.profiles[self.selected_profile].display_name.clone();
             }
             KeyCode::Char('d')
                 if self.section == Section::Profiles
@@ -716,6 +763,27 @@ impl App {
                 }
             }
         }
+        if previous_section != self.section
+            && matches!(
+                self.input_mode,
+                InputMode::CreateProfile
+                    | InputMode::RenameProfile
+                    | InputMode::AddServer
+                    | InputMode::ConnectInvitation
+            )
+        {
+            self.input_mode = InputMode::None;
+            self.input.clear();
+        }
+        // Clicking the create row (or opening Profiles before the first
+        // profile exists) must focus the visible input immediately.
+        if self.section == Section::Profiles
+            && self.selected_profile >= self.profiles.len()
+            && (previous_section != self.section || matches!(event, AppEvent::SelectIndex(_)))
+        {
+            self.input_mode = InputMode::CreateProfile;
+            self.input.clear();
+        }
         if self.section == Section::Chats
             && (previous_section != Section::Chats
                 || previous_chat.as_ref() != self.selected_chat_ref())
@@ -784,10 +852,33 @@ impl App {
                     self.message_cache.clear();
                     self.loaded_chat = None;
                     self.auto_delete_pending = None;
+                    self.profile_create_pending = false;
+                    self.input_mode = InputMode::None;
+                    self.input.clear();
                     self.invitation_link = None;
                     self.invitation_error = None;
                     self.notice = Some("Profile created".into());
                     self.sync_selected_profile();
+                }
+                SimplexEvent::ProfileCreateFailed(error) => {
+                    self.profile_create_pending = false;
+                    self.notice = Some(format!("Could not create profile: {error}"));
+                }
+                SimplexEvent::ProfileRenamed {
+                    profiles,
+                    active_user,
+                } => {
+                    self.profiles = profiles;
+                    if let Some(user) = active_user {
+                        self.startup = StartupState::Ready(user);
+                    }
+                    self.input_mode = InputMode::None;
+                    self.input.clear();
+                    self.notice = Some("Profile renamed".into());
+                    self.sync_selected_profile();
+                }
+                SimplexEvent::ProfileRenameFailed(error) => {
+                    self.notice = Some(format!("Could not rename profile: {error}"));
                 }
                 SimplexEvent::ProfileDeleted {
                     profiles,
@@ -1237,7 +1328,11 @@ impl App {
     }
 
     fn handle_paste(&mut self, text: String) {
-        if self.input_mode == InputMode::ConnectInvitation {
+        if matches!(
+            self.input_mode,
+            InputMode::CreateProfile | InputMode::RenameProfile | InputMode::ConnectInvitation
+        ) && !self.profile_create_pending
+        {
             self.input.push_str(text.trim());
         }
     }
@@ -1336,6 +1431,26 @@ impl App {
         let _ = self
             .simplex_commands
             .send(SimplexCommand::DeleteProfile(user_id));
+    }
+
+    fn rename_profile(&mut self) {
+        let Some(profile) = self.profiles.get(self.selected_profile) else {
+            self.input_mode = InputMode::None;
+            self.input.clear();
+            return;
+        };
+        let display_name = self.input.trim().to_owned();
+        if display_name.is_empty() {
+            return;
+        }
+        let user_id = profile.id;
+        self.input_mode = InputMode::None;
+        self.input.clear();
+        self.notice = Some(format!("Renaming profile {}…", profile.display_name));
+        let _ = self.simplex_commands.send(SimplexCommand::RenameProfile {
+            user_id,
+            display_name,
+        });
     }
 
     fn open_chat_deletion(&mut self) {
@@ -2048,6 +2163,78 @@ mod tests {
             panic!("expected delete-profile command")
         };
         assert_eq!(user_id, 9);
+    }
+
+    #[tokio::test]
+    async fn profile_rename_uses_a_typed_wrapper_command() {
+        let (commands, receiver) = mpsc::channel();
+        let mut app = App {
+            section: Section::Profiles,
+            profiles: vec![Profile {
+                id: 9,
+                display_name: "work".into(),
+                notifications: true,
+                active: true,
+            }],
+            simplex_commands: commands,
+            ..App::default()
+        };
+
+        app.handle_key_events(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(app.input_mode, InputMode::RenameProfile);
+        assert_eq!(app.input, "work");
+        app.input = "personal".into();
+        app.handle_key_events(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+
+        let SimplexCommand::RenameProfile {
+            user_id,
+            display_name,
+        } = receiver.try_recv().unwrap()
+        else {
+            panic!("expected rename-profile command")
+        };
+        assert_eq!(user_id, 9);
+        assert_eq!(display_name, "personal");
+    }
+
+    #[tokio::test]
+    async fn empty_profile_row_accepts_a_name_and_creates_profile() {
+        let (commands, receiver) = mpsc::channel();
+        let mut app = App {
+            section: Section::Profiles,
+            simplex_commands: commands,
+            ..App::default()
+        };
+
+        // The row looks like an editor, so typing must focus it immediately;
+        // no preliminary Enter should be necessary.
+        for character in "Alice (Private)".chars() {
+            app.handle_key_events(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE))
+                .unwrap();
+        }
+        assert_eq!(app.input_mode, InputMode::CreateProfile);
+        assert_eq!(app.input, "Alice (Private)");
+        app.handle_key_events(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+
+        let SimplexCommand::CreateProfile(display_name) = receiver.try_recv().unwrap() else {
+            panic!("expected create-profile command")
+        };
+        assert_eq!(display_name, "Alice (Private)");
+    }
+
+    #[tokio::test]
+    async fn clicking_empty_profile_row_focuses_the_name_editor() {
+        let mut app = App {
+            section: Section::Profiles,
+            ..App::default()
+        };
+
+        app.handle_app_event(AppEvent::SelectIndex(0));
+
+        assert_eq!(app.input_mode, InputMode::CreateProfile);
     }
 
     #[tokio::test]

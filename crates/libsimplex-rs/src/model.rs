@@ -117,6 +117,12 @@ pub enum SimplexEvent {
         profiles: Vec<Profile>,
         chats: Vec<ChatSummary>,
     },
+    ProfileCreateFailed(String),
+    ProfileRenamed {
+        profiles: Vec<Profile>,
+        active_user: Option<User>,
+    },
+    ProfileRenameFailed(String),
     ProfileDeleted {
         profiles: Vec<Profile>,
         active_user: Option<User>,
@@ -405,8 +411,10 @@ pub fn active_user(value: &Value) -> Result<Option<User>, String> {
             .and_then(Value::as_i64)
             .ok_or("activeUser response has no numeric userId")?,
         display_name: user
-            .get("localDisplayName")
+            .pointer("/profile/fullName")
             .and_then(Value::as_str)
+            .filter(|name| !name.is_empty())
+            .or_else(|| user.get("localDisplayName").and_then(Value::as_str))
             .unwrap_or("SimpleX user")
             .to_owned(),
         notifications: user
@@ -440,8 +448,10 @@ pub fn profiles(value: &Value) -> Result<Vec<Profile>, String> {
                     .and_then(Value::as_i64)
                     .ok_or("profile has no numeric userId")?,
                 display_name: user
-                    .get("localDisplayName")
+                    .pointer("/profile/fullName")
                     .and_then(Value::as_str)
+                    .filter(|name| !name.is_empty())
+                    .or_else(|| user.get("localDisplayName").and_then(Value::as_str))
                     .unwrap_or("SimpleX user")
                     .to_owned(),
                 notifications: user
