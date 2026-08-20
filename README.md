@@ -6,6 +6,47 @@
   <img src="./screenshot.png" alt="simplex-tui chat interface" width="900">
 </p>
 
+## Installation
+
+### Build from source
+
+To build simplex-tui locally, you need Git and a current Rust toolchain with
+Cargo. The recommended way to install Rust and Cargo is
+[`rustup`](https://rustup.rs/). The build is supported on Debian/Ubuntu Linux,
+macOS, and 64-bit Windows.
+
+1. Clone the repository and enter its directory:
+
+   ```bash
+   git clone https://github.com/floscodes/simplex-tui.git
+   cd simplex-tui
+   ```
+
+2. Build the optimized release binary:
+
+   ```bash
+   cargo build --release
+   ```
+
+   The first build can take some time. Cargo automatically runs the appropriate
+   platform bootstrap script, installs the required native build packages,
+   GHC 9.6.3, and Cabal if they are missing, and then compiles the pinned
+   SimpleX Chat library and simplex-tui. On macOS, Homebrew is used for system
+   packages. On Windows, run the build in the UCRT64 MSYS2 environment installed
+   by GHCup. Automatic Linux package installation currently supports
+   Debian/Ubuntu.
+
+3. Start simplex-tui:
+
+   ```bash
+   ./target/release/simplex-tui
+   ```
+
+   On Windows, run `target\release\simplex-tui.exe` instead. Application data
+   is stored in `~/.simplex-tui`.
+
+Precompiled binaries will be available soon.
+
 [Ratatui]: https://ratatui.rs
 [event driven async template]: https://github.com/ratatui/templates/tree/main/event-driven-async
 
