@@ -78,6 +78,16 @@ pub enum SimplexCommand {
         chat_ref: ChatRef,
         member_id: i64,
     },
+    BlockGroupMember {
+        chat_ref: ChatRef,
+        member_id: i64,
+        blocked: bool,
+    },
+    ChangeGroupMemberRole {
+        chat_ref: ChatRef,
+        member_id: i64,
+        role: String,
+    },
     RenameGroup {
         user_id: i64,
         chat_ref: ChatRef,
@@ -514,6 +524,37 @@ fn command_loop(
                         "Member removed",
                     )
                     .unwrap_or_else(SimplexEvent::GroupActionFailed);
+                    sender.send(event).map_err(|e| e.to_string())?;
+                }
+                SimplexCommand::BlockGroupMember {
+                    chat_ref,
+                    member_id,
+                    blocked,
+                } => {
+                    let event = change_group_member(
+                        &controller,
+                        &chat_ref,
+                        &format!(
+                            "/_block {} {member_id} blocked={}",
+                            chat_ref.0,
+                            if blocked { "on" } else { "off" }
+                        ),
+                        if blocked {
+                            "Member blocked for all"
+                        } else {
+                            "Member unblocked"
+                        },
+                    )
+                    .unwrap_or_else(SimplexEvent::GroupActionFailed);
+                    sender.send(event).map_err(|e| e.to_string())?;
+                }
+                SimplexCommand::ChangeGroupMemberRole {
+                    chat_ref,
+                    member_id,
+                    role,
+                } => {
+                    let event = change_group_member_role(&controller, &chat_ref, member_id, &role)
+                        .unwrap_or_else(SimplexEvent::GroupActionFailed);
                     sender.send(event).map_err(|e| e.to_string())?;
                 }
                 SimplexCommand::RenameGroup {
@@ -1123,6 +1164,27 @@ fn change_group_member(
         members: load_group_members(controller, chat_ref)?,
         message: message.into(),
     })
+}
+
+fn change_group_member_role(
+    controller: &crate::ffi::SimplexController,
+    chat_ref: &ChatRef,
+    member_id: i64,
+    role: &str,
+) -> Result<SimplexEvent, String> {
+    group_id(chat_ref)?;
+    if !matches!(
+        role,
+        "observer" | "member" | "moderator" | "admin" | "owner"
+    ) {
+        return Err("unsupported group role".into());
+    }
+    change_group_member(
+        controller,
+        chat_ref,
+        &format!("/_member role {} {member_id} {role}", chat_ref.0),
+        "Member role changed",
+    )
 }
 
 fn rename_group(

@@ -51,13 +51,27 @@ pub(crate) struct GroupManagementDialog {
     pub members: Vec<GroupMember>,
     pub selected: usize,
     pub adding: bool,
+    pub role_target: Option<usize>,
     pub pending: bool,
     pub error: Option<String>,
 }
 
 #[derive(Clone, Debug)]
 pub(crate) enum GroupAction {
-    Remove { member_id: i64, name: String },
+    Remove {
+        member_id: i64,
+        name: String,
+    },
+    Block {
+        member_id: i64,
+        name: String,
+        blocked: bool,
+    },
+    ChangeRole {
+        member_id: i64,
+        name: String,
+        role: String,
+    },
     Leave,
     Delete,
     DeleteLocal,
@@ -1145,6 +1159,7 @@ impl App {
                         dialog.members = members;
                         dialog.pending = false;
                         dialog.adding = false;
+                        dialog.role_target = None;
                         dialog.error = None;
                     }
                     self.notice = Some(message);
@@ -1213,6 +1228,15 @@ impl App {
                     if !self.selected_chat_is_writable() {
                         self.composer_focused = false;
                         self.composer.clear();
+                    }
+                    if let Some(chat_ref) = self
+                        .group_management_dialog
+                        .as_ref()
+                        .map(|dialog| dialog.chat_ref.clone())
+                    {
+                        let _ = self
+                            .simplex_commands
+                            .send(SimplexCommand::LoadGroupMembers(chat_ref));
                     }
                 }
                 SimplexEvent::GroupRemoved(chat_ref) => self.remove_group(&chat_ref),
@@ -1462,7 +1486,7 @@ impl App {
         !chat.chat_ref.0.starts_with('#')
             || !matches!(
                 chat.group_status.as_deref(),
-                Some("rejected" | "removed" | "left" | "deleted" | "invited")
+                Some("rejected" | "removed" | "left" | "deleted" | "invited" | "blocked")
             )
     }
 
@@ -1637,6 +1661,7 @@ impl App {
             members: Vec::new(),
             selected: 0,
             adding: false,
+            role_target: None,
             pending: true,
             error: None,
         });
@@ -1668,6 +1693,11 @@ impl App {
 
     fn handle_group_management_key(&mut self, key: KeyEvent) {
         let contacts_len = self.group_contacts().len();
+        let role_options = self
+            .group_management_dialog
+            .as_ref()
+            .map(Self::available_group_roles)
+            .unwrap_or_default();
         let Some(dialog) = &mut self.group_management_dialog else {
             return;
         };
@@ -1677,7 +1707,9 @@ impl App {
             }
             return;
         }
-        let item_count = if dialog.adding {
+        let item_count = if dialog.role_target.is_some() {
+            role_options.len()
+        } else if dialog.adding {
             contacts_len
         } else {
             dialog.members.len()
@@ -1686,9 +1718,24 @@ impl App {
             .members
             .iter()
             .any(|member| member.is_self && member.role == "owner");
+        let can_admin = dialog
+            .members
+            .iter()
+            .any(|member| member.is_self && matches!(member.role.as_str(), "admin" | "owner"));
+        let is_current_member = dialog.members.iter().any(|member| {
+            member.is_self
+                && !matches!(
+                    member.status.as_str(),
+                    "rejected" | "removed" | "left" | "deleted"
+                )
+        });
         match key.code {
             KeyCode::Esc if dialog.adding => {
                 dialog.adding = false;
+                dialog.selected = 0;
+            }
+            KeyCode::Esc if dialog.role_target.is_some() => {
+                dialog.role_target = None;
                 dialog.selected = 0;
             }
             KeyCode::Esc => self.group_management_dialog = None,
@@ -1696,11 +1743,21 @@ impl App {
             KeyCode::Down | KeyCode::Char('j') => {
                 dialog.selected = (dialog.selected + 1).min(item_count.saturating_sub(1))
             }
-            KeyCode::Char('a') if !dialog.adding && is_owner => {
+            KeyCode::Char('a')
+                if !dialog.adding
+                    && dialog.role_target.is_none()
+                    && is_current_member
+                    && can_admin =>
+            {
                 dialog.adding = true;
                 dialog.selected = 0;
             }
-            KeyCode::Char('r') if !dialog.adding && is_owner => {
+            KeyCode::Char('r')
+                if !dialog.adding
+                    && dialog.role_target.is_none()
+                    && is_current_member
+                    && is_owner =>
+            {
                 let chat_ref = dialog.chat_ref.clone();
                 self.input = self.group_name(&chat_ref);
                 self.input_mode = InputMode::RenameGroup;
@@ -1718,9 +1775,36 @@ impl App {
                     }
                 }
             }
-            KeyCode::Char('d') if !dialog.adding && is_owner => self.ask_remove_group_member(),
-            KeyCode::Char('l') if !dialog.adding => self.ask_group_exit(false),
-            KeyCode::Char('x') if !dialog.adding => self.ask_group_delete(),
+            KeyCode::Char('d')
+                if !dialog.adding
+                    && dialog.role_target.is_none()
+                    && is_current_member
+                    && can_admin =>
+            {
+                self.ask_remove_group_member()
+            }
+            KeyCode::Char('b')
+                if !dialog.adding
+                    && dialog.role_target.is_none()
+                    && is_current_member
+                    && Self::can_moderate_group(dialog) =>
+            {
+                self.ask_block_group_member()
+            }
+            KeyCode::Char('o')
+                if !dialog.adding && dialog.role_target.is_none() && is_current_member =>
+            {
+                self.open_group_role_picker()
+            }
+            KeyCode::Enter if dialog.role_target.is_some() => self.change_group_member_role(),
+            KeyCode::Char('l')
+                if !dialog.adding && dialog.role_target.is_none() && is_current_member =>
+            {
+                self.ask_group_exit(false)
+            }
+            KeyCode::Char('x') if !dialog.adding && dialog.role_target.is_none() => {
+                self.ask_group_delete()
+            }
             _ => {}
         }
     }
@@ -1773,6 +1857,119 @@ impl App {
         });
     }
 
+    fn can_moderate_group(dialog: &GroupManagementDialog) -> bool {
+        dialog.members.iter().any(|member| {
+            member.is_self && matches!(member.role.as_str(), "moderator" | "admin" | "owner")
+        })
+    }
+
+    fn role_rank(role: &str) -> usize {
+        match role {
+            "observer" => 0,
+            "member" => 1,
+            "moderator" => 2,
+            "admin" => 3,
+            "owner" => 4,
+            _ => usize::MAX,
+        }
+    }
+
+    pub(crate) fn available_group_roles(dialog: &GroupManagementDialog) -> Vec<&'static str> {
+        let Some(own) = dialog.members.iter().find(|member| member.is_self) else {
+            return Vec::new();
+        };
+        if Self::role_rank(&own.role) < Self::role_rank("admin") {
+            return Vec::new();
+        }
+        ["observer", "member", "moderator", "admin", "owner"]
+            .into_iter()
+            .filter(|role| Self::role_rank(role) <= Self::role_rank(&own.role))
+            .collect()
+    }
+
+    fn open_group_role_picker(&mut self) {
+        let Some(dialog) = &mut self.group_management_dialog else {
+            return;
+        };
+        let Some(target) = dialog.members.get(dialog.selected) else {
+            return;
+        };
+        let own_role = dialog
+            .members
+            .iter()
+            .find(|member| member.is_self)
+            .map(|member| member.role.as_str())
+            .unwrap_or("");
+        let target_allowed = !target.is_self
+            && Self::role_rank(own_role) >= Self::role_rank("admin")
+            && Self::role_rank(own_role) >= Self::role_rank(&target.role)
+            && !matches!(
+                target.status.as_str(),
+                "removed" | "left" | "pending_approval" | "pending_review"
+            );
+        if !target_allowed {
+            self.notice = Some("You cannot change this member's role".into());
+            return;
+        }
+        let current_role = target.role.clone();
+        dialog.role_target = Some(dialog.selected);
+        dialog.selected = Self::available_group_roles(dialog)
+            .iter()
+            .position(|role| *role == current_role)
+            .unwrap_or(0);
+    }
+
+    fn change_group_member_role(&mut self) {
+        let Some((chat_ref, member_id, member_name, role)) =
+            self.group_management_dialog.as_ref().and_then(|dialog| {
+                let target_index = dialog.role_target?;
+                let role = Self::available_group_roles(dialog)
+                    .get(dialog.selected)?
+                    .to_string();
+                let member = dialog.members.get(target_index)?;
+                Some((
+                    dialog.chat_ref.clone(),
+                    member.id,
+                    member.display_name.clone(),
+                    role,
+                ))
+            })
+        else {
+            return;
+        };
+        self.group_confirmation = Some(GroupConfirmation {
+            chat_ref: chat_ref.clone(),
+            group_name: self.group_name(&chat_ref),
+            action: GroupAction::ChangeRole {
+                member_id,
+                name: member_name,
+                role,
+            },
+        });
+    }
+
+    fn ask_block_group_member(&mut self) {
+        let Some(dialog) = &self.group_management_dialog else {
+            return;
+        };
+        let Some(member) = dialog.members.get(dialog.selected) else {
+            return;
+        };
+        if member.is_self {
+            self.notice = Some("You cannot block yourself".into());
+            return;
+        }
+        self.group_confirmation = Some(GroupConfirmation {
+            chat_ref: dialog.chat_ref.clone(),
+            group_name: self.group_name(&dialog.chat_ref),
+            action: GroupAction::Block {
+                member_id: member.id,
+                name: member.display_name.clone(),
+                blocked: !member.blocked,
+            },
+        });
+    }
+
     fn ask_group_exit(&mut self, delete: bool) {
         let Some(dialog) = &self.group_management_dialog else {
             return;
@@ -1821,6 +2018,28 @@ impl App {
                     .send(SimplexCommand::RemoveGroupMember {
                         chat_ref: confirmation.chat_ref,
                         member_id,
+                    });
+            }
+            GroupAction::Block {
+                member_id, blocked, ..
+            } => {
+                let _ = self
+                    .simplex_commands
+                    .send(SimplexCommand::BlockGroupMember {
+                        chat_ref: confirmation.chat_ref,
+                        member_id,
+                        blocked,
+                    });
+            }
+            GroupAction::ChangeRole {
+                member_id, role, ..
+            } => {
+                let _ = self
+                    .simplex_commands
+                    .send(SimplexCommand::ChangeGroupMemberRole {
+                        chat_ref: confirmation.chat_ref,
+                        member_id,
+                        role,
                     });
             }
             GroupAction::Leave | GroupAction::Delete | GroupAction::DeleteLocal => {
@@ -3172,6 +3391,7 @@ mod tests {
                         role: "member".into(),
                         status: "connected".into(),
                         is_self: false,
+                        blocked: false,
                     },
                     GroupMember {
                         id: 13,
@@ -3180,6 +3400,7 @@ mod tests {
                         role: "owner".into(),
                         status: "creator".into(),
                         is_self: true,
+                        blocked: false,
                     },
                 ],
             })
@@ -3229,9 +3450,11 @@ mod tests {
                     role: "owner".into(),
                     status: "creator".into(),
                     is_self: true,
+                    blocked: false,
                 }],
                 selected: 0,
                 adding: false,
+                role_target: None,
                 pending: false,
                 error: None,
             }),
@@ -3254,6 +3477,122 @@ mod tests {
                 chat_ref: ChatRef(ref value),
                 ref name,
             } if value == "#7" && name == "Friends (Vienna)"
+        ));
+    }
+
+    #[tokio::test]
+    async fn moderator_can_block_a_group_member_for_all() {
+        let (commands, receiver) = mpsc::channel();
+        let mut app = App {
+            chats: vec![ChatSummary {
+                chat_ref: ChatRef("#7".into()),
+                display_name: "Friends".into(),
+                unread_count: 0,
+                group_status: Some("connected".into()),
+            }],
+            group_management_dialog: Some(GroupManagementDialog {
+                chat_ref: ChatRef("#7".into()),
+                members: vec![
+                    GroupMember {
+                        id: 12,
+                        contact_id: Some(22),
+                        display_name: "Bob".into(),
+                        role: "member".into(),
+                        status: "connected".into(),
+                        is_self: false,
+                        blocked: false,
+                    },
+                    GroupMember {
+                        id: 13,
+                        contact_id: None,
+                        display_name: "Alice".into(),
+                        role: "moderator".into(),
+                        status: "connected".into(),
+                        is_self: true,
+                        blocked: false,
+                    },
+                ],
+                selected: 0,
+                adding: false,
+                role_target: None,
+                pending: false,
+                error: None,
+            }),
+            simplex_commands: commands,
+            ..App::default()
+        };
+
+        app.handle_key_events(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE))
+            .unwrap();
+        app.handle_key_events(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))
+            .unwrap();
+
+        assert!(matches!(
+            receiver.try_recv().unwrap(),
+            SimplexCommand::BlockGroupMember {
+                chat_ref: ChatRef(ref value),
+                member_id: 12,
+                blocked: true,
+            } if value == "#7"
+        ));
+    }
+
+    #[tokio::test]
+    async fn admin_can_assign_roles_up_to_admin_but_not_owner() {
+        let (commands, receiver) = mpsc::channel();
+        let mut app = App {
+            group_management_dialog: Some(GroupManagementDialog {
+                chat_ref: ChatRef("#7".into()),
+                members: vec![
+                    GroupMember {
+                        id: 12,
+                        contact_id: Some(22),
+                        display_name: "Bob".into(),
+                        role: "member".into(),
+                        status: "connected".into(),
+                        is_self: false,
+                        blocked: false,
+                    },
+                    GroupMember {
+                        id: 13,
+                        contact_id: None,
+                        display_name: "Alice".into(),
+                        role: "admin".into(),
+                        status: "connected".into(),
+                        is_self: true,
+                        blocked: false,
+                    },
+                ],
+                selected: 0,
+                adding: false,
+                role_target: None,
+                pending: false,
+                error: None,
+            }),
+            simplex_commands: commands,
+            ..App::default()
+        };
+
+        assert_eq!(
+            App::available_group_roles(app.group_management_dialog.as_ref().unwrap()),
+            vec!["observer", "member", "moderator", "admin"]
+        );
+        app.handle_key_events(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE))
+            .unwrap();
+        app.handle_key_events(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
+            .unwrap();
+        app.handle_key_events(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        app.handle_key_events(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))
+            .unwrap();
+
+        assert!(matches!(
+            receiver.try_recv().unwrap(),
+            SimplexCommand::ChangeGroupMemberRole {
+                chat_ref: ChatRef(ref value),
+                member_id: 12,
+                ref role,
+            } if value == "#7" && role == "moderator"
         ));
     }
 }

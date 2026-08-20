@@ -143,7 +143,7 @@ fn render_sidebar(app: &App, area: Rect, buf: &mut Buffer) {
                 .iter()
                 .map(|chat| {
                     let name = if chat.chat_ref.0.starts_with('#') {
-                        format!("👥 {}", chat.display_name)
+                        format!("{} (group)", chat.display_name)
                     } else {
                         chat.display_name.clone()
                     };
@@ -599,7 +599,9 @@ fn render_chat(app: &App, area: Rect, buf: &mut Buffer) {
         summary.group_status.as_deref(),
         Some("left" | "removed" | "rejected")
     );
-    let conversation_area = if former_member {
+    let blocked = summary.group_status.as_deref() == Some("blocked");
+    let restricted = former_member || blocked;
+    let conversation_area = if restricted {
         Rect::new(
             rows[1].x,
             rows[1].y,
@@ -699,18 +701,22 @@ fn render_chat(app: &App, area: Rect, buf: &mut Buffer) {
         + visible_start.saturating_sub(1) * gap;
     render_chat_scrollbar(conversation_area, buf, total_height, available, top_line);
 
-    if former_member && rows[1].height > 0 {
-        Paragraph::new("You are not a member of this group anymore")
-            .alignment(Alignment::Center)
-            .style(
-                Style::default()
-                    .fg(Color::DarkGray)
-                    .add_modifier(Modifier::ITALIC),
-            )
-            .render(
-                Rect::new(rows[1].x, rows[1].bottom() - 1, rows[1].width, 1),
-                buf,
-            );
+    if restricted && rows[1].height > 0 {
+        Paragraph::new(if blocked {
+            "You are blocked in this group"
+        } else {
+            "You are not a member of this group anymore"
+        })
+        .alignment(Alignment::Center)
+        .style(
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::ITALIC),
+        )
+        .render(
+            Rect::new(rows[1].x, rows[1].bottom() - 1, rows[1].width, 1),
+            buf,
+        );
     }
 
     if app.chat_scroll > 0 && conversation_area.width > 4 && conversation_area.height > 0 {
@@ -755,6 +761,8 @@ fn render_chat(app: &App, area: Rect, buf: &mut Buffer) {
     });
     let mut draft = if writable {
         app.composer.clone()
+    } else if blocked {
+        "You are blocked in this group".into()
     } else {
         "You are not a member of this group anymore".into()
     };
@@ -851,7 +859,15 @@ fn render_group_management(app: &App, area: Rect, buf: &mut Buffer) {
             .render(inner, buf);
         return;
     }
-    let (title, entries): (&str, Vec<String>) = if dialog.adding {
+    let (title, entries): (&str, Vec<String>) = if dialog.role_target.is_some() {
+        (
+            "Select the new role",
+            App::available_group_roles(dialog)
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+        )
+    } else if dialog.adding {
         (
             "Select a contact to invite",
             app.group_contacts()
@@ -870,7 +886,12 @@ fn render_group_management(app: &App, area: Rect, buf: &mut Buffer) {
                         "{}  [{}]{}",
                         member.display_name,
                         member.role,
-                        if member.is_self { "  (you)" } else { "" }
+                        match (member.is_self, member.blocked) {
+                            (true, true) => "  (you, blocked)",
+                            (true, false) => "  (you)",
+                            (false, true) => "  (blocked)",
+                            (false, false) => "",
+                        }
                     )
                 })
                 .collect(),
@@ -904,10 +925,32 @@ fn render_group_management(app: &App, area: Rect, buf: &mut Buffer) {
         .members
         .iter()
         .any(|member| member.is_self && member.role == "owner");
-    lines.push(Line::from(if dialog.adding {
+    let can_moderate = dialog.members.iter().any(|member| {
+        member.is_self && matches!(member.role.as_str(), "moderator" | "admin" | "owner")
+    });
+    let can_admin = dialog
+        .members
+        .iter()
+        .any(|member| member.is_self && matches!(member.role.as_str(), "admin" | "owner"));
+    let is_current_member = dialog.members.iter().any(|member| {
+        member.is_self
+            && !matches!(
+                member.status.as_str(),
+                "rejected" | "removed" | "left" | "deleted"
+            )
+    });
+    lines.push(Line::from(if dialog.role_target.is_some() {
+        "↑/↓: select · Enter: change role · Esc: back"
+    } else if dialog.adding {
         "↑/↓: select · Enter: invite · Esc: back"
+    } else if !is_current_member {
+        "x: delete locally · Esc: close"
     } else if is_owner {
-        "a: add · r: rename · d: remove · l: leave · x: delete group · Esc: close"
+        "a: add · r: rename · o: role · b: block/unblock · d: remove · l: leave · x: delete group · Esc: close"
+    } else if can_admin {
+        "a: add · o: role · b: block/unblock · d: remove · l: leave · x: delete locally · Esc: close"
+    } else if can_moderate {
+        "b: block/unblock · l: leave · x: delete locally · Esc: close"
     } else {
         "l: leave · x: delete locally · Esc: close"
     }));
@@ -928,6 +971,15 @@ fn render_group_confirmation(app: &App, area: Rect, buf: &mut Buffer) {
     };
     let action = match &confirmation.action {
         GroupAction::Remove { name, .. } => format!("remove {name} from the group"),
+        GroupAction::Block { name, blocked, .. } => {
+            format!(
+                "{} {name} for all",
+                if *blocked { "block" } else { "unblock" }
+            )
+        }
+        GroupAction::ChangeRole { name, role, .. } => {
+            format!("change {name}’s role to {role}")
+        }
         GroupAction::Leave => "leave the group".into(),
         GroupAction::Delete => "permanently delete the group".into(),
         GroupAction::DeleteLocal => "delete the group locally".into(),

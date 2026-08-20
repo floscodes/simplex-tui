@@ -59,6 +59,7 @@ pub struct GroupMember {
     pub role: String,
     pub status: String,
     pub is_self: bool,
+    pub blocked: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -591,10 +592,17 @@ pub fn chats(value: &Value) -> Result<Vec<ChatSummary>, String> {
                 chat_ref,
                 display_name,
                 unread_count,
-                group_status: info
-                    .pointer("/groupInfo/membership/memberStatus")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned),
+                group_status: if info
+                    .pointer("/groupInfo/membership/blockedByAdmin")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+                {
+                    Some("blocked".into())
+                } else {
+                    info.pointer("/groupInfo/membership/memberStatus")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                },
             })
         })
         .collect()
@@ -630,7 +638,7 @@ pub fn group_members(value: &Value) -> Result<Vec<GroupMember>, String> {
         .or_else(|| group.get("members"))
         .and_then(Value::as_array)
         .ok_or("groupMembers response has no members array")?;
-    membership
+    let parsed = membership
         .into_iter()
         .chain(members)
         .map(|member| {
@@ -658,9 +666,28 @@ pub fn group_members(value: &Value) -> Result<Vec<GroupMember>, String> {
                     .unwrap_or("unknown")
                     .to_owned(),
                 is_self: member.get("memberCategory").and_then(Value::as_str) == Some("user"),
+                blocked: member
+                    .get("blockedByAdmin")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
             })
         })
-        .collect()
+        .collect::<Result<Vec<_>, String>>()?;
+    Ok(parsed
+        .into_iter()
+        .filter(|member| {
+            member.is_self
+                || !matches!(
+                    member.status.as_str(),
+                    "invited"
+                        | "pending_approval"
+                        | "pending_review"
+                        | "removed"
+                        | "left"
+                        | "deleted"
+                )
+        })
+        .collect())
 }
 
 pub fn chat_messages(value: &Value) -> Result<(ChatRef, Vec<Message>), String> {
@@ -976,12 +1003,19 @@ mod tests {
             "chatInfo": {"type": "group", "groupInfo": {"groupId": 47,
                 "localDisplayName": "Removed", "membership": {"memberStatus": "removed"}}},
             "chatStats": {"unreadCount": 0}
+        }, {
+            "chatInfo": {"type": "group", "groupInfo": {"groupId": 48,
+                "localDisplayName": "Blocked", "membership": {
+                    "memberStatus": "connected", "blockedByAdmin": true
+                }}},
+            "chatStats": {"unreadCount": 0}
         }]}}))
         .unwrap();
-        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed.len(), 3);
         assert_eq!(parsed[0].chat_ref, ChatRef("#46".into()));
         assert_eq!(parsed[0].group_status.as_deref(), Some("left"));
         assert_eq!(parsed[1].group_status.as_deref(), Some("removed"));
+        assert_eq!(parsed[2].group_status.as_deref(), Some("blocked"));
 
         let invitation = parse_message(&json!({
             "chatDir": {"type": "directRcv"},
@@ -1279,6 +1313,20 @@ mod tests {
                     "memberStatus": "connected",
                     "localDisplayName": "Bob",
                     "memberProfile": {"fullName": ""}
+                }, {
+                    "groupMemberId": 3,
+                    "memberCategory": "post",
+                    "memberRole": "member",
+                    "memberStatus": "removed",
+                    "localDisplayName": "Charlie",
+                    "memberProfile": {"fullName": "Charlie"}
+                }, {
+                    "groupMemberId": 4,
+                    "memberCategory": "post",
+                    "memberRole": "member",
+                    "memberStatus": "invited",
+                    "localDisplayName": "Dora",
+                    "memberProfile": {"fullName": "Dora"}
                 }]
             }
         }}))
@@ -1288,5 +1336,11 @@ mod tests {
         assert_eq!(members[0].display_name, "Alice Example");
         assert_eq!(members[1].display_name, "Bob");
         assert_eq!(members[1].contact_id, Some(22));
+        assert!(
+            !members
+                .iter()
+                .any(|member| member.display_name == "Charlie")
+        );
+        assert!(!members.iter().any(|member| member.display_name == "Dora"));
     }
 }
