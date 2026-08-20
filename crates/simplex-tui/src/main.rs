@@ -41,6 +41,20 @@ fn bundled_library_path() -> std::path::PathBuf {
     } else {
         "libsimplex.dll"
     };
+    if let Ok(executable) = std::env::current_exe()
+        && let Some(directory) = executable.parent()
+    {
+        let beside_executable = directory.join(name);
+        if beside_executable.is_file() {
+            return beside_executable;
+        }
+        let library_directory = directory.join("lib").join(name);
+        if library_directory.is_file() {
+            return library_directory;
+        }
+    }
+
+    // Development fallback for `cargo run` and local test builds.
     std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
         .join("vendor/libsimplex")

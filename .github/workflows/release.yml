@@ -1,0 +1,108 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-unix:
+    name: Build ${{ matrix.asset }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            asset: simplex-tui-linux-x86_64
+          - os: macos-15
+            asset: simplex-tui-macos-aarch64
+          - os: macos-15-intel
+            asset: simplex-tui-macos-x86_64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build application and native SimpleX library
+        run: cargo build --locked --release -p simplex-tui
+      - name: Package release
+        env:
+          ASSET: ${{ matrix.asset }}
+        run: |
+          set -euo pipefail
+          package="dist/$ASSET"
+          mkdir -p "$package"
+          cp target/release/simplex-tui "$package/"
+          cp README.md LICENSE "$package/"
+          if [[ "${{ runner.os }}" == "Linux" ]]; then
+            cp vendor/libsimplex/*.so "$package/"
+          else
+            cp vendor/libsimplex/*.dylib "$package/"
+          fi
+          tar -C dist -czf "dist/$ASSET.tar.gz" "$ASSET"
+          if command -v sha256sum >/dev/null 2>&1; then
+            (cd dist && sha256sum "$ASSET.tar.gz" > "$ASSET.tar.gz.sha256")
+          else
+            (cd dist && shasum -a 256 "$ASSET.tar.gz" > "$ASSET.tar.gz.sha256")
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: |
+            dist/${{ matrix.asset }}.tar.gz
+            dist/${{ matrix.asset }}.tar.gz.sha256
+          if-no-files-found: error
+
+  build-windows:
+    name: Build simplex-tui-windows-x86_64
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build application and native SimpleX library
+        run: cargo build --locked --release -p simplex-tui
+      - name: Package release
+        shell: pwsh
+        run: |
+          $Asset = "simplex-tui-windows-x86_64"
+          $Package = Join-Path "dist" $Asset
+          New-Item -ItemType Directory -Force $Package | Out-Null
+          Copy-Item "target/release/simplex-tui.exe" $Package
+          Copy-Item "README.md", "LICENSE" $Package
+          Copy-Item "vendor/libsimplex/*.dll" $Package
+          $Archive = Join-Path "dist" "$Asset.zip"
+          Compress-Archive -Path $Package -DestinationPath $Archive
+          $Hash = (Get-FileHash -Algorithm SHA256 $Archive).Hash.ToLowerInvariant()
+          "$Hash  $Asset.zip" | Set-Content -NoNewline "$Archive.sha256"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: simplex-tui-windows-x86_64
+          path: |
+            dist/simplex-tui-windows-x86_64.zip
+            dist/simplex-tui-windows-x86_64.zip.sha256
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub release
+    needs: [build-unix, build-windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Create release through the GitHub API
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          gh release create "$TAG" dist/* \
+            --verify-tag \
+            --title "simplex-tui $TAG" \
+            --generate-notes
