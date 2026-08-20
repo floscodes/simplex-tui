@@ -13,8 +13,9 @@ use std::{path::Path, path::PathBuf, sync::Arc, sync::mpsc};
 pub use client::{ChatDeleteMode, ChatFeature, SimplexCommand as Command};
 pub use ffi::SimplexError as Error;
 pub use model::{
-    Attachment, AttachmentKind, ChatDeletionSettings, ChatFeatures, ChatRef, ChatSummary, Message,
-    MessageReaction, Profile, ServerEntry, ServerProtocol, SimplexEvent as Event, User,
+    Attachment, AttachmentKind, ChatDeletionSettings, ChatFeatures, ChatRef, ChatSummary,
+    GroupInvitation, GroupMember, Message, MessageReaction, Profile, ServerEntry, ServerProtocol,
+    SimplexEvent as Event, User,
 };
 
 /// Loaded official SimpleX Chat runtime.

@@ -11,7 +11,7 @@ use crate::preferences::Preferences;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind};
 use libsimplex_rs::{
     ChatDeleteMode, ChatDeletionSettings, ChatFeature, ChatFeatures, ChatRef, ChatSummary,
-    Command as SimplexCommand, Event as SimplexEvent, Message, Profile, ServerEntry,
+    Command as SimplexCommand, Event as SimplexEvent, GroupMember, Message, Profile, ServerEntry,
     ServerProtocol, Session, User,
 };
 use ratatui::{DefaultTerminal, layout::Rect};
@@ -41,12 +41,47 @@ pub enum InputMode {
     ConfirmDeleteProfile,
     AddServer,
     ConnectInvitation,
+    CreateGroup,
+    RenameGroup,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct GroupManagementDialog {
+    pub chat_ref: ChatRef,
+    pub members: Vec<GroupMember>,
+    pub selected: usize,
+    pub adding: bool,
+    pub pending: bool,
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum GroupAction {
+    Remove { member_id: i64, name: String },
+    Leave,
+    Delete,
+    DeleteLocal,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct GroupConfirmation {
+    pub chat_ref: ChatRef,
+    pub group_name: String,
+    pub action: GroupAction,
 }
 
 #[derive(Clone, Debug)]
 pub(crate) struct MessageHitbox {
     pub area: Rect,
     pub item_id: i64,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct GroupInvitationHitbox {
+    pub area: Rect,
+    pub item_id: i64,
+    pub group_id: i64,
+    pub accept: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -129,11 +164,14 @@ pub struct App {
     pub(crate) chat_deletion_change_area: Cell<Rect>,
     pub(crate) chat_setting_areas: RefCell<Vec<(Rect, usize)>>,
     pub(crate) message_hitboxes: RefCell<Vec<MessageHitbox>>,
+    pub(crate) group_invitation_hitboxes: RefCell<Vec<GroupInvitationHitbox>>,
     pub(crate) reaction_picker: Option<ReactionPicker>,
     pub(crate) reaction_option_areas: RefCell<Vec<(Rect, String)>>,
     pub(crate) chat_deletion_dialog: Option<ChatDeletionDialog>,
     pub(crate) chat_delete_confirmation: Option<ChatDeleteConfirmation>,
     pub(crate) download_cancel_dialog: Option<DownloadCancelDialog>,
+    pub(crate) group_management_dialog: Option<GroupManagementDialog>,
+    pub(crate) group_confirmation: Option<GroupConfirmation>,
     pub(crate) download_cancel_no_area: Cell<Rect>,
     pub(crate) download_cancel_yes_area: Cell<Rect>,
     pub events: EventHandler,
@@ -192,11 +230,14 @@ impl Default for App {
             chat_deletion_change_area: Cell::new(Rect::default()),
             chat_setting_areas: RefCell::new(Vec::new()),
             message_hitboxes: RefCell::new(Vec::new()),
+            group_invitation_hitboxes: RefCell::new(Vec::new()),
             reaction_picker: None,
             reaction_option_areas: RefCell::new(Vec::new()),
             chat_deletion_dialog: None,
             chat_delete_confirmation: None,
             download_cancel_dialog: None,
+            group_management_dialog: None,
+            group_confirmation: None,
             download_cancel_no_area: Cell::new(Rect::default()),
             download_cancel_yes_area: Cell::new(Rect::default()),
             events: EventHandler::new(),
@@ -272,6 +313,16 @@ impl App {
                 KeyCode::Char('y') => self.confirm_cancel_download(),
                 KeyCode::Enter | KeyCode::Esc | KeyCode::Char('n') => {
                     self.download_cancel_dialog = None
+                }
+                _ => {}
+            }
+            return Ok(());
+        }
+        if self.group_confirmation.is_some() {
+            match key.code {
+                KeyCode::Char('y') => self.confirm_group_action(),
+                KeyCode::Enter | KeyCode::Esc | KeyCode::Char('n') => {
+                    self.group_confirmation = None
                 }
                 _ => {}
             }
@@ -378,6 +429,44 @@ impl App {
             }
             return Ok(());
         }
+        if self.input_mode == InputMode::CreateGroup {
+            match key.code {
+                KeyCode::Esc => {
+                    self.input_mode = InputMode::None;
+                    self.input.clear();
+                }
+                KeyCode::Enter if !self.input.trim().is_empty() => self.create_group(),
+                KeyCode::Backspace => {
+                    self.input.pop();
+                }
+                KeyCode::Char(character) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.input.push(character)
+                }
+                _ => {}
+            }
+            return Ok(());
+        }
+        if self.input_mode == InputMode::RenameGroup {
+            match key.code {
+                KeyCode::Esc => {
+                    self.input_mode = InputMode::None;
+                    self.input.clear();
+                }
+                KeyCode::Enter if !self.input.trim().is_empty() => self.rename_group(),
+                KeyCode::Backspace => {
+                    self.input.pop();
+                }
+                KeyCode::Char(character) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.input.push(character)
+                }
+                _ => {}
+            }
+            return Ok(());
+        }
+        if self.group_management_dialog.is_some() {
+            self.handle_group_management_key(key);
+            return Ok(());
+        }
         if self.chat_deletion_dialog.is_some() {
             match key.code {
                 KeyCode::Esc => self.chat_deletion_dialog = None,
@@ -389,6 +478,11 @@ impl App {
             return Ok(());
         }
         if self.composer_focused {
+            if !self.selected_chat_is_writable() {
+                self.composer_focused = false;
+                self.composer.clear();
+                return Ok(());
+            }
             match key.code {
                 KeyCode::Esc => self.composer_focused = false,
                 KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
@@ -430,6 +524,18 @@ impl App {
             KeyCode::Esc | KeyCode::Char('q') => self.events.send(AppEvent::Quit),
             KeyCode::Char('n') if self.section == Section::Chats => self.show_invitation(),
             KeyCode::Char('p') if self.section == Section::Chats => self.show_connect_invitation(),
+            KeyCode::Char('g') if self.section == Section::Chats => {
+                self.input_mode = InputMode::CreateGroup;
+                self.input.clear();
+            }
+            KeyCode::Char('m')
+                if self.section == Section::Chats
+                    && self
+                        .selected_chat_ref()
+                        .is_some_and(|chat| chat.0.starts_with('#')) =>
+            {
+                self.open_group_management();
+            }
             KeyCode::Char('s')
                 if self.section == Section::Chats && self.selected_chat < self.chats.len() =>
             {
@@ -448,7 +554,9 @@ impl App {
                 }
             }
             KeyCode::Enter | KeyCode::Char('i')
-                if self.section == Section::Chats && self.selected_chat < self.chats.len() =>
+                if self.section == Section::Chats
+                    && self.selected_chat < self.chats.len()
+                    && self.selected_chat_is_writable() =>
             {
                 self.composer_focused = true
             }
@@ -623,6 +731,22 @@ impl App {
             }
             return;
         }
+        if left_click {
+            let invitation = self
+                .group_invitation_hitboxes
+                .borrow()
+                .iter()
+                .find(|hitbox| hitbox.area.contains((column, row).into()))
+                .cloned();
+            if let Some(invitation) = invitation {
+                self.answer_group_invitation(
+                    invitation.item_id,
+                    invitation.group_id,
+                    invitation.accept,
+                );
+                return;
+            }
+        }
         if matches!(kind, MouseEventKind::Down(MouseButton::Right)) {
             let item_id = self
                 .message_hitboxes
@@ -679,7 +803,7 @@ impl App {
                 return;
             }
             if self.composer_area.get().contains((column, row).into()) {
-                self.composer_focused = true;
+                self.composer_focused = self.selected_chat_is_writable();
                 return;
             }
         }
@@ -770,10 +894,16 @@ impl App {
                     | InputMode::RenameProfile
                     | InputMode::AddServer
                     | InputMode::ConnectInvitation
+                    | InputMode::CreateGroup
+                    | InputMode::RenameGroup
             )
         {
             self.input_mode = InputMode::None;
             self.input.clear();
+        }
+        if previous_section != self.section {
+            self.group_management_dialog = None;
+            self.group_confirmation = None;
         }
         // Clicking the create row (or opening Profiles before the first
         // profile exists) must focus the visible input immediately.
@@ -975,6 +1105,117 @@ impl App {
                         self.notice = Some(format!("Could not delete chat: {error}"));
                     }
                 }
+                SimplexEvent::GroupCreated { chat_ref, chats } => {
+                    self.chats = chats;
+                    self.input_mode = InputMode::None;
+                    self.input.clear();
+                    self.selected_chat = self
+                        .chats
+                        .iter()
+                        .position(|chat| chat.chat_ref == chat_ref)
+                        .unwrap_or(0);
+                    self.notice = Some("Group created".into());
+                    self.loaded_chat = None;
+                }
+                SimplexEvent::GroupMembersLoaded { chat_ref, members } => {
+                    if let Some(dialog) = &mut self.group_management_dialog
+                        && dialog.chat_ref == chat_ref
+                    {
+                        dialog.members = members;
+                        dialog.pending = false;
+                        dialog.error = None;
+                        dialog.selected =
+                            dialog.selected.min(dialog.members.len().saturating_sub(1));
+                    }
+                }
+                SimplexEvent::GroupChanged {
+                    chat_ref,
+                    chats,
+                    members,
+                    message,
+                } => {
+                    let group_closed = matches!(message.as_str(), "Group left" | "Group deleted");
+                    if !chats.is_empty() {
+                        self.chats = chats;
+                        self.selected_chat = self.selected_chat.min(self.chats.len());
+                    }
+                    if let Some(dialog) = &mut self.group_management_dialog
+                        && dialog.chat_ref == chat_ref
+                    {
+                        dialog.members = members;
+                        dialog.pending = false;
+                        dialog.adding = false;
+                        dialog.error = None;
+                    }
+                    self.notice = Some(message);
+                    if !self.selected_chat_is_writable() {
+                        self.composer_focused = false;
+                        self.composer.clear();
+                    }
+                    if group_closed || !self.chats.iter().any(|chat| chat.chat_ref == chat_ref) {
+                        self.group_management_dialog = None;
+                        if !self.chats.iter().any(|chat| chat.chat_ref == chat_ref) {
+                            self.loaded_chat = None;
+                            self.messages.clear();
+                        }
+                    }
+                }
+                SimplexEvent::GroupActionFailed(error) => {
+                    if let Some(dialog) = &mut self.group_management_dialog {
+                        dialog.pending = false;
+                        dialog.error = Some(error.clone());
+                    }
+                    self.notice = Some(format!("Group action failed: {error}"));
+                }
+                SimplexEvent::GroupInvitationAnswered {
+                    contact_chat_ref,
+                    item_id,
+                    chats,
+                    accepted,
+                } => {
+                    self.chats = chats;
+                    if let Some(messages) = self.message_cache.get_mut(&contact_chat_ref) {
+                        messages.retain(|message| message.id != item_id);
+                    }
+                    if self.loaded_chat.as_ref() == Some(&contact_chat_ref) {
+                        self.messages.retain(|message| message.id != item_id);
+                    }
+                    self.notice = Some(
+                        if accepted {
+                            "Group joined"
+                        } else {
+                            "Group invitation declined"
+                        }
+                        .into(),
+                    );
+                }
+                SimplexEvent::GroupListUpdated(chats) => {
+                    let selected = self.selected_chat_ref().cloned();
+                    self.chats = chats;
+                    let selected_position = selected.as_ref().and_then(|selected| {
+                        self.chats
+                            .iter()
+                            .position(|chat| &chat.chat_ref == selected)
+                    });
+                    self.selected_chat = selected_position.unwrap_or_else(|| {
+                        self.selected_chat.min(self.chats.len().saturating_sub(1))
+                    });
+                    if let Some(removed) = selected
+                        && !self.chats.iter().any(|chat| chat.chat_ref == removed)
+                    {
+                        self.message_cache.remove(&removed);
+                        if self.loaded_chat.as_ref() == Some(&removed) {
+                            self.loaded_chat = None;
+                            self.messages.clear();
+                        }
+                        self.group_management_dialog = None;
+                    }
+                    if !self.selected_chat_is_writable() {
+                        self.composer_focused = false;
+                        self.composer.clear();
+                    }
+                }
+                SimplexEvent::GroupRemoved(chat_ref) => self.remove_group(&chat_ref),
                 SimplexEvent::FileDownloadStarted { file_id, path } => {
                     update_attachment_status(
                         &mut self.messages,
@@ -1214,8 +1455,39 @@ impl App {
             .map(|chat| &chat.chat_ref)
     }
 
+    pub(crate) fn selected_chat_is_writable(&self) -> bool {
+        let Some(chat) = self.chats.get(self.selected_chat) else {
+            return false;
+        };
+        !chat.chat_ref.0.starts_with('#')
+            || !matches!(
+                chat.group_status.as_deref(),
+                Some("rejected" | "removed" | "left" | "deleted" | "invited")
+            )
+    }
+
+    fn remove_group(&mut self, chat_ref: &ChatRef) {
+        self.chats.retain(|chat| &chat.chat_ref != chat_ref);
+        self.message_cache.remove(chat_ref);
+        self.selected_chat = self.selected_chat.min(self.chats.len().saturating_sub(1));
+        if self.loaded_chat.as_ref() == Some(chat_ref) {
+            self.loaded_chat = None;
+            self.messages.clear();
+            self.composer.clear();
+            self.composer_focused = false;
+        }
+        if self
+            .group_management_dialog
+            .as_ref()
+            .map(|dialog| &dialog.chat_ref)
+            == Some(chat_ref)
+        {
+            self.group_management_dialog = None;
+        }
+    }
+
     fn send_message(&mut self) {
-        if self.composer.trim().is_empty() || self.sending {
+        if self.composer.trim().is_empty() || self.sending || !self.selected_chat_is_writable() {
             return;
         }
         let text = self.composer.clone();
@@ -1330,11 +1602,276 @@ impl App {
     fn handle_paste(&mut self, text: String) {
         if matches!(
             self.input_mode,
-            InputMode::CreateProfile | InputMode::RenameProfile | InputMode::ConnectInvitation
+            InputMode::CreateProfile
+                | InputMode::RenameProfile
+                | InputMode::ConnectInvitation
+                | InputMode::CreateGroup
+                | InputMode::RenameGroup
         ) && !self.profile_create_pending
         {
             self.input.push_str(text.trim());
         }
+    }
+
+    fn create_group(&mut self) {
+        let Some(user_id) = self.active_user().map(|user| user.id) else {
+            self.notice = Some("Create a profile first".into());
+            return;
+        };
+        let name = self.input.trim().to_owned();
+        self.notice = Some("Creating group…".into());
+        let _ = self
+            .simplex_commands
+            .send(SimplexCommand::CreateGroup { user_id, name });
+    }
+
+    fn open_group_management(&mut self) {
+        let Some(chat_ref) = self.selected_chat_ref().cloned() else {
+            return;
+        };
+        if !chat_ref.0.starts_with('#') {
+            return;
+        }
+        self.group_management_dialog = Some(GroupManagementDialog {
+            chat_ref: chat_ref.clone(),
+            members: Vec::new(),
+            selected: 0,
+            adding: false,
+            pending: true,
+            error: None,
+        });
+        let _ = self
+            .simplex_commands
+            .send(SimplexCommand::LoadGroupMembers(chat_ref));
+    }
+
+    pub(crate) fn group_contacts(&self) -> Vec<(i64, String)> {
+        let member_contacts: Vec<i64> = self
+            .group_management_dialog
+            .iter()
+            .flat_map(|dialog| &dialog.members)
+            .filter_map(|member| member.contact_id)
+            .collect();
+        self.chats
+            .iter()
+            .filter_map(|chat| {
+                chat.chat_ref
+                    .0
+                    .strip_prefix('@')?
+                    .parse()
+                    .ok()
+                    .filter(|id| !member_contacts.contains(id))
+                    .map(|id| (id, chat.display_name.clone()))
+            })
+            .collect()
+    }
+
+    fn handle_group_management_key(&mut self, key: KeyEvent) {
+        let contacts_len = self.group_contacts().len();
+        let Some(dialog) = &mut self.group_management_dialog else {
+            return;
+        };
+        if dialog.pending {
+            if key.code == KeyCode::Esc {
+                self.group_management_dialog = None;
+            }
+            return;
+        }
+        let item_count = if dialog.adding {
+            contacts_len
+        } else {
+            dialog.members.len()
+        };
+        let is_owner = dialog
+            .members
+            .iter()
+            .any(|member| member.is_self && member.role == "owner");
+        match key.code {
+            KeyCode::Esc if dialog.adding => {
+                dialog.adding = false;
+                dialog.selected = 0;
+            }
+            KeyCode::Esc => self.group_management_dialog = None,
+            KeyCode::Up | KeyCode::Char('k') => dialog.selected = dialog.selected.saturating_sub(1),
+            KeyCode::Down | KeyCode::Char('j') => {
+                dialog.selected = (dialog.selected + 1).min(item_count.saturating_sub(1))
+            }
+            KeyCode::Char('a') if !dialog.adding && is_owner => {
+                dialog.adding = true;
+                dialog.selected = 0;
+            }
+            KeyCode::Char('r') if !dialog.adding && is_owner => {
+                let chat_ref = dialog.chat_ref.clone();
+                self.input = self.group_name(&chat_ref);
+                self.input_mode = InputMode::RenameGroup;
+            }
+            KeyCode::Enter if dialog.adding => {
+                let selected = dialog.selected;
+                let chat_ref = dialog.chat_ref.clone();
+                if let Some((contact_id, _)) = self.group_contacts().get(selected) {
+                    let _ = self.simplex_commands.send(SimplexCommand::AddGroupMember {
+                        chat_ref,
+                        contact_id: *contact_id,
+                    });
+                    if let Some(dialog) = &mut self.group_management_dialog {
+                        dialog.pending = true;
+                    }
+                }
+            }
+            KeyCode::Char('d') if !dialog.adding && is_owner => self.ask_remove_group_member(),
+            KeyCode::Char('l') if !dialog.adding => self.ask_group_exit(false),
+            KeyCode::Char('x') if !dialog.adding => self.ask_group_delete(),
+            _ => {}
+        }
+    }
+
+    fn group_name(&self, chat_ref: &ChatRef) -> String {
+        self.chats
+            .iter()
+            .find(|chat| &chat.chat_ref == chat_ref)
+            .map_or_else(|| "Group".into(), |chat| chat.display_name.clone())
+    }
+
+    fn rename_group(&mut self) {
+        let Some(user_id) = self.active_user().map(|user| user.id) else {
+            return;
+        };
+        let Some(dialog) = &mut self.group_management_dialog else {
+            self.input_mode = InputMode::None;
+            return;
+        };
+        let name = self.input.trim().to_owned();
+        dialog.pending = true;
+        dialog.error = None;
+        self.input_mode = InputMode::None;
+        self.input.clear();
+        let _ = self.simplex_commands.send(SimplexCommand::RenameGroup {
+            user_id,
+            chat_ref: dialog.chat_ref.clone(),
+            name,
+        });
+    }
+
+    fn ask_remove_group_member(&mut self) {
+        let Some(dialog) = &self.group_management_dialog else {
+            return;
+        };
+        let Some(member) = dialog.members.get(dialog.selected) else {
+            return;
+        };
+        if member.is_self {
+            self.notice = Some("Use l to leave the group".into());
+            return;
+        }
+        self.group_confirmation = Some(GroupConfirmation {
+            chat_ref: dialog.chat_ref.clone(),
+            group_name: self.group_name(&dialog.chat_ref),
+            action: GroupAction::Remove {
+                member_id: member.id,
+                name: member.display_name.clone(),
+            },
+        });
+    }
+
+    fn ask_group_exit(&mut self, delete: bool) {
+        let Some(dialog) = &self.group_management_dialog else {
+            return;
+        };
+        self.group_confirmation = Some(GroupConfirmation {
+            chat_ref: dialog.chat_ref.clone(),
+            group_name: self.group_name(&dialog.chat_ref),
+            action: if delete {
+                GroupAction::Delete
+            } else {
+                GroupAction::Leave
+            },
+        });
+    }
+
+    fn ask_group_delete(&mut self) {
+        let Some(dialog) = &self.group_management_dialog else {
+            return;
+        };
+        let is_owner = dialog
+            .members
+            .iter()
+            .any(|member| member.is_self && member.role == "owner");
+        self.group_confirmation = Some(GroupConfirmation {
+            chat_ref: dialog.chat_ref.clone(),
+            group_name: self.group_name(&dialog.chat_ref),
+            action: if is_owner {
+                GroupAction::Delete
+            } else {
+                GroupAction::DeleteLocal
+            },
+        });
+    }
+
+    fn confirm_group_action(&mut self) {
+        let Some(confirmation) = self.group_confirmation.take() else {
+            return;
+        };
+        if let Some(dialog) = &mut self.group_management_dialog {
+            dialog.pending = true;
+        }
+        match confirmation.action {
+            GroupAction::Remove { member_id, .. } => {
+                let _ = self
+                    .simplex_commands
+                    .send(SimplexCommand::RemoveGroupMember {
+                        chat_ref: confirmation.chat_ref,
+                        member_id,
+                    });
+            }
+            GroupAction::Leave | GroupAction::Delete | GroupAction::DeleteLocal => {
+                let Some(user_id) = self.active_user().map(|user| user.id) else {
+                    return;
+                };
+                let command = if matches!(confirmation.action, GroupAction::Delete) {
+                    SimplexCommand::DeleteGroup {
+                        user_id,
+                        chat_ref: confirmation.chat_ref,
+                    }
+                } else if matches!(confirmation.action, GroupAction::DeleteLocal) {
+                    SimplexCommand::DeleteGroupLocally {
+                        user_id,
+                        chat_ref: confirmation.chat_ref,
+                    }
+                } else {
+                    SimplexCommand::LeaveGroup {
+                        user_id,
+                        chat_ref: confirmation.chat_ref,
+                    }
+                };
+                let _ = self.simplex_commands.send(command);
+            }
+        }
+    }
+
+    fn answer_group_invitation(&mut self, item_id: i64, group_id: i64, accept: bool) {
+        let Some(user_id) = self.active_user().map(|user| user.id) else {
+            return;
+        };
+        let Some(contact_chat_ref) = self.loaded_chat.clone() else {
+            return;
+        };
+        self.notice = Some(
+            if accept {
+                "Joining group…"
+            } else {
+                "Declining invitation…"
+            }
+            .into(),
+        );
+        let _ = self
+            .simplex_commands
+            .send(SimplexCommand::AnswerGroupInvitation {
+                user_id,
+                contact_chat_ref,
+                item_id,
+                group_id,
+                accept,
+            });
     }
 
     fn toggle_chat_feature(&mut self, feature: ChatFeature, enabled: bool) {
@@ -1800,11 +2337,13 @@ mod tests {
                     chat_ref: ChatRef("@1".into()),
                     display_name: "alice".into(),
                     unread_count: 0,
+                    group_status: None,
                 },
                 ChatSummary {
                     chat_ref: ChatRef("@2".into()),
                     display_name: "bob".into(),
                     unread_count: 0,
+                    group_status: None,
                 },
             ],
             profiles: vec![Profile {
@@ -1855,6 +2394,7 @@ mod tests {
                 chat_ref: ChatRef("@7".into()),
                 display_name: "alice".into(),
                 unread_count: 0,
+                group_status: None,
             }],
             composer_focused: true,
             simplex_commands: commands,
@@ -1918,6 +2458,7 @@ mod tests {
                 chat_ref: ChatRef("#3".into()),
                 display_name: "team".into(),
                 unread_count: 0,
+                group_status: None,
             }],
             composer: "hello team".into(),
             simplex_commands: commands,
@@ -1943,6 +2484,7 @@ mod tests {
                 chat_ref: ChatRef("@7".into()),
                 display_name: "alice".into(),
                 unread_count: 0,
+                group_status: None,
             }],
             loaded_chat: Some(ChatRef("@7".into())),
             simplex_events: event_receiver,
@@ -1956,8 +2498,10 @@ mod tests {
                     text: "hello".into(),
                     timestamp: String::new(),
                     outgoing: false,
+                    sender_name: None,
                     reactions: Vec::new(),
                     attachment: None,
+                    group_invitation: None,
                 },
             })
             .unwrap();
@@ -1989,6 +2533,7 @@ mod tests {
                 chat_ref: chat_ref.clone(),
                 display_name: "alice".into(),
                 unread_count: 0,
+                group_status: None,
             }],
             loaded_chat: Some(chat_ref.clone()),
             simplex_events: event_receiver,
@@ -2002,8 +2547,10 @@ mod tests {
                     text: "sent from the TUI".into(),
                     timestamp: String::new(),
                     outgoing: true,
+                    sender_name: None,
                     reactions: Vec::new(),
                     attachment: None,
+                    group_invitation: None,
                 },
             })
             .unwrap();
@@ -2025,6 +2572,7 @@ mod tests {
                 chat_ref: ChatRef("@7".into()),
                 display_name: "alice".into(),
                 unread_count: 0,
+                group_status: None,
             }],
             simplex_events: event_receiver,
             ..App::default()
@@ -2037,8 +2585,10 @@ mod tests {
                     text: "sent elsewhere".into(),
                     timestamp: String::new(),
                     outgoing: true,
+                    sender_name: None,
                     reactions: Vec::new(),
                     attachment: None,
+                    group_invitation: None,
                 },
             })
             .unwrap();
@@ -2057,6 +2607,7 @@ mod tests {
                 chat_ref: ChatRef("@7".into()),
                 display_name: "alice".into(),
                 unread_count: 2,
+                group_status: None,
             }],
             loaded_chat: Some(ChatRef("@7".into())),
             simplex_commands: commands,
@@ -2083,11 +2634,13 @@ mod tests {
                     chat_ref: ChatRef("@1".into()),
                     display_name: "alice".into(),
                     unread_count: 0,
+                    group_status: None,
                 },
                 ChatSummary {
                     chat_ref: ChatRef("@2".into()),
                     display_name: "bob".into(),
                     unread_count: 0,
+                    group_status: None,
                 },
             ],
             loaded_chat: Some(ChatRef("@1".into())),
@@ -2099,8 +2652,10 @@ mod tests {
             text: "from background".into(),
             timestamp: String::new(),
             outgoing: false,
+            sender_name: None,
             reactions: Vec::new(),
             attachment: None,
+            group_invitation: None,
         };
         event_sender
             .send(SimplexEvent::MessageReceived {
@@ -2283,6 +2838,7 @@ mod tests {
                 chat_ref: chat_ref.clone(),
                 display_name: "bob".into(),
                 unread_count: 0,
+                group_status: None,
             }],
             startup: StartupState::Ready(User {
                 id: 3,
@@ -2377,6 +2933,7 @@ mod tests {
                 text: String::new(),
                 timestamp: String::new(),
                 outgoing: false,
+                sender_name: None,
                 reactions: Vec::new(),
                 attachment: Some(libsimplex_rs::Attachment {
                     id: 41,
@@ -2387,6 +2944,7 @@ mod tests {
                     progress: Some(50),
                     path: None,
                 }),
+                group_invitation: None,
             }],
             simplex_commands: commands,
             ..App::default()
@@ -2473,15 +3031,229 @@ mod tests {
                     chat_ref: ChatRef("@1".into()),
                     display_name: "alice".into(),
                     unread_count: 2,
+                    group_status: None,
                 },
                 ChatSummary {
                     chat_ref: ChatRef("@2".into()),
                     display_name: "bob".into(),
                     unread_count: 3,
+                    group_status: None,
                 },
             ],
             ..App::default()
         };
         assert_eq!(app.total_unread(), 5);
+    }
+
+    #[tokio::test]
+    async fn owner_deleted_group_is_removed_from_the_active_conversation() {
+        let (event_sender, simplex_events) = mpsc::channel();
+        let mut app = App {
+            chats: vec![ChatSummary {
+                chat_ref: ChatRef("#7".into()),
+                display_name: "Friends".into(),
+                unread_count: 0,
+                group_status: Some("connected".into()),
+            }],
+            loaded_chat: Some(ChatRef("#7".into())),
+            composer: "draft".into(),
+            composer_focused: true,
+            messages: vec![Message {
+                id: 1,
+                text: "hello".into(),
+                timestamp: String::new(),
+                outgoing: false,
+                sender_name: None,
+                reactions: Vec::new(),
+                attachment: None,
+                group_invitation: None,
+            }],
+            simplex_events,
+            ..App::default()
+        };
+        event_sender
+            .send(SimplexEvent::GroupRemoved(ChatRef("#7".into())))
+            .unwrap();
+
+        app.tick();
+
+        assert!(app.chats.is_empty());
+        assert_eq!(app.loaded_chat, None);
+        assert!(app.messages.is_empty());
+        assert!(app.composer.is_empty());
+        assert!(!app.composer_focused);
+    }
+
+    #[tokio::test]
+    async fn former_group_member_cannot_focus_or_send() {
+        let (simplex_commands, receiver) = mpsc::channel();
+        let mut app = App {
+            chats: vec![ChatSummary {
+                chat_ref: ChatRef("#7".into()),
+                display_name: "Friends".into(),
+                unread_count: 0,
+                group_status: Some("left".into()),
+            }],
+            composer: "draft".into(),
+            simplex_commands,
+            ..App::default()
+        };
+
+        app.handle_key_events(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE))
+            .unwrap();
+        app.send_message();
+
+        assert!(!app.composer_focused);
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn group_creation_uses_a_typed_wrapper_command() {
+        let (commands, receiver) = mpsc::channel();
+        let mut app = App {
+            section: Section::Chats,
+            startup: StartupState::Ready(User {
+                id: 3,
+                display_name: "Alice".into(),
+                notifications: true,
+                active: true,
+            }),
+            simplex_commands: commands,
+            ..App::default()
+        };
+
+        app.handle_key_events(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE))
+            .unwrap();
+        for character in "Friends (Vienna)".chars() {
+            app.handle_key_events(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE))
+                .unwrap();
+        }
+        app.handle_key_events(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+
+        let SimplexCommand::CreateGroup { user_id, name } = receiver.try_recv().unwrap() else {
+            panic!("expected create-group command")
+        };
+        assert_eq!(user_id, 3);
+        assert_eq!(name, "Friends (Vienna)");
+    }
+
+    #[tokio::test]
+    async fn group_management_loads_members_and_confirms_removal() {
+        let (commands, receiver) = mpsc::channel();
+        let (event_sender, simplex_events) = mpsc::channel();
+        let mut app = App {
+            section: Section::Chats,
+            chats: vec![ChatSummary {
+                chat_ref: ChatRef("#7".into()),
+                display_name: "Friends".into(),
+                unread_count: 0,
+                group_status: None,
+            }],
+            simplex_commands: commands,
+            simplex_events,
+            ..App::default()
+        };
+
+        app.handle_key_events(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE))
+            .unwrap();
+        assert!(matches!(
+            receiver.try_recv().unwrap(),
+            SimplexCommand::LoadGroupMembers(ChatRef(ref value)) if value == "#7"
+        ));
+        event_sender
+            .send(SimplexEvent::GroupMembersLoaded {
+                chat_ref: ChatRef("#7".into()),
+                members: vec![
+                    GroupMember {
+                        id: 12,
+                        contact_id: Some(22),
+                        display_name: "Bob".into(),
+                        role: "member".into(),
+                        status: "connected".into(),
+                        is_self: false,
+                    },
+                    GroupMember {
+                        id: 13,
+                        contact_id: None,
+                        display_name: "Alice".into(),
+                        role: "owner".into(),
+                        status: "creator".into(),
+                        is_self: true,
+                    },
+                ],
+            })
+            .unwrap();
+        app.tick();
+        assert!(matches!(
+            receiver.try_recv().unwrap(),
+            SimplexCommand::LoadChat(ChatRef(ref value)) if value == "#7"
+        ));
+        app.handle_key_events(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE))
+            .unwrap();
+        app.handle_key_events(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))
+            .unwrap();
+
+        assert!(matches!(
+            receiver.try_recv().unwrap(),
+            SimplexCommand::RemoveGroupMember {
+                chat_ref: ChatRef(ref value),
+                member_id: 12
+            } if value == "#7"
+        ));
+    }
+
+    #[tokio::test]
+    async fn group_management_renames_via_typed_wrapper_command() {
+        let (commands, receiver) = mpsc::channel();
+        let mut app = App {
+            section: Section::Chats,
+            startup: StartupState::Ready(User {
+                id: 3,
+                display_name: "Alice".into(),
+                notifications: true,
+                active: true,
+            }),
+            chats: vec![ChatSummary {
+                chat_ref: ChatRef("#7".into()),
+                display_name: "Friends".into(),
+                unread_count: 0,
+                group_status: None,
+            }],
+            group_management_dialog: Some(GroupManagementDialog {
+                chat_ref: ChatRef("#7".into()),
+                members: vec![GroupMember {
+                    id: 3,
+                    contact_id: None,
+                    display_name: "Alice".into(),
+                    role: "owner".into(),
+                    status: "creator".into(),
+                    is_self: true,
+                }],
+                selected: 0,
+                adding: false,
+                pending: false,
+                error: None,
+            }),
+            simplex_commands: commands,
+            ..App::default()
+        };
+
+        app.handle_key_events(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(app.input_mode, InputMode::RenameGroup);
+        assert_eq!(app.input, "Friends");
+        app.input = "Friends (Vienna)".into();
+        app.handle_key_events(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+
+        assert!(matches!(
+            receiver.try_recv().unwrap(),
+            SimplexCommand::RenameGroup {
+                user_id: 3,
+                chat_ref: ChatRef(ref value),
+                ref name,
+            } if value == "#7" && name == "Friends (Vienna)"
+        ));
     }
 }

@@ -11,7 +11,7 @@ use ratatui::{
 use tui_qrcode::{Colors, QrCodeWidget, Scaling};
 use unicode_width::UnicodeWidthStr;
 
-use crate::app::{App, InputMode, Section, StartupState};
+use crate::app::{App, GroupAction, InputMode, Section, StartupState};
 use crate::preferences::Theme;
 use libsimplex_rs::{AttachmentKind, ChatDeleteMode, Message};
 
@@ -45,6 +45,7 @@ impl Widget for &App {
         self.download_cancel_no_area.set(Rect::default());
         self.download_cancel_yes_area.set(Rect::default());
         self.message_hitboxes.borrow_mut().clear();
+        self.group_invitation_hitboxes.borrow_mut().clear();
         self.reaction_option_areas.borrow_mut().clear();
         self.chat_setting_areas.borrow_mut().clear();
         let columns = Layout::default()
@@ -59,7 +60,11 @@ impl Widget for &App {
         render_tabs(self, sidebar[0], buf);
         render_sidebar(self, sidebar[1], buf);
         render_detail(self, columns[1], buf);
-        if self.download_cancel_dialog.is_some() {
+        if self.group_confirmation.is_some() {
+            render_group_confirmation(self, area, buf);
+        } else if self.group_management_dialog.is_some() {
+            render_group_management(self, area, buf);
+        } else if self.download_cancel_dialog.is_some() {
             render_download_cancel_confirmation(self, area, buf);
         } else if self.chat_delete_confirmation.is_some() {
             render_chat_delete_confirmation(self, area, buf);
@@ -137,10 +142,15 @@ fn render_sidebar(app: &App, area: Rect, buf: &mut Buffer) {
             app.chats
                 .iter()
                 .map(|chat| {
-                    if chat.unread_count == 0 {
-                        chat.display_name.clone()
+                    let name = if chat.chat_ref.0.starts_with('#') {
+                        format!("👥 {}", chat.display_name)
                     } else {
-                        format!("{} ({})", chat.display_name, chat.unread_count)
+                        chat.display_name.clone()
+                    };
+                    if chat.unread_count == 0 {
+                        name
+                    } else {
+                        format!("{name} ({})", chat.unread_count)
                     }
                 })
                 .chain(app.active_user().map(|_| "＋ Invite or connect".to_owned()))
@@ -199,10 +209,23 @@ fn render_sidebar(app: &App, area: Rect, buf: &mut Buffer) {
 
 fn render_detail(app: &App, area: Rect, buf: &mut Buffer) {
     match app.section {
+        Section::Chats if app.input_mode == InputMode::CreateGroup => {
+            render_create_group(app, area, buf)
+        }
         Section::Chats => render_chat(app, area, buf),
         Section::Profiles => render_profile(app, area, buf),
         Section::Settings => render_settings(app, area, buf),
     }
+}
+
+fn render_create_group(app: &App, area: Rect, buf: &mut Buffer) {
+    Paragraph::new(format!(
+        "Create a private SimpleX group\n\nGroup name\n{}▏\n\nEnter: create · Esc: cancel\n\nSpaces and round brackets are supported.",
+        app.input
+    ))
+    .block(panel("New group").padding(Padding::new(2, 2, 1, 1)))
+    .wrap(Wrap { trim: false })
+    .render(area, buf);
 }
 
 fn render_profile(app: &App, area: Rect, buf: &mut Buffer) {
@@ -542,7 +565,7 @@ fn render_chat(app: &App, area: Rect, buf: &mut Buffer) {
                 if user.display_name.is_empty() {
                     "No conversations yet."
                 } else {
-                    "No conversations yet.\n\nPress n to create an invitation or p to paste one."
+                    "No conversations yet.\n\nPress n to create an invitation, p to paste one, or g to create a group."
                 },
             ),
             StartupState::Failed(error) => ("SimpleX error", error.as_str()),
@@ -572,18 +595,36 @@ fn render_chat(app: &App, area: Rect, buf: &mut Buffer) {
         .alignment(Alignment::Center)
         .fg(Color::DarkGray)
         .render(rows[0], buf);
-    let available = usize::from(rows[1].height);
+    let former_member = matches!(
+        summary.group_status.as_deref(),
+        Some("left" | "removed" | "rejected")
+    );
+    let conversation_area = if former_member {
+        Rect::new(
+            rows[1].x,
+            rows[1].y,
+            rows[1].width,
+            rows[1].height.saturating_sub(1),
+        )
+    } else {
+        rows[1]
+    };
+    let available = usize::from(conversation_area.height);
     let bubble_specs: Vec<(u16, u16)> = app
         .messages
         .iter()
         .map(|message| {
             let time = message.timestamp.get(11..16).unwrap_or("");
-            let prefix = if message.outgoing { "You" } else { chat };
+            let prefix = if message.outgoing {
+                "You"
+            } else {
+                message.sender_name.as_deref().unwrap_or(chat)
+            };
             bubble_size(
                 &message_display_text(message),
                 prefix,
                 time,
-                rows[1].width,
+                conversation_area.width,
                 !message.reactions.is_empty(),
             )
         })
@@ -623,20 +664,20 @@ fn render_chat(app: &App, area: Rect, buf: &mut Buffer) {
     if let Some(error) = &app.chat_error {
         Paragraph::new(error.as_str())
             .fg(Color::Red)
-            .render(rows[1], buf);
+            .render(conversation_area, buf);
     } else if app.chat_loading || app.loaded_chat.as_ref() != Some(&summary.chat_ref) {
         Paragraph::new("Loading messages…")
             .fg(Color::DarkGray)
-            .render(rows[1], buf);
+            .render(conversation_area, buf);
     } else if visible_start == visible_end {
         Paragraph::new("No messages in this conversation.")
             .fg(Color::DarkGray)
-            .render(rows[1], buf);
+            .render(conversation_area, buf);
     } else {
         render_message_bubbles(
             app,
             chat,
-            rows[1],
+            conversation_area,
             buf,
             &bubble_specs,
             visible_start,
@@ -656,20 +697,34 @@ fn render_chat(app: &App, area: Rect, buf: &mut Buffer) {
         .map(|(height, _)| usize::from(*height))
         .sum::<usize>()
         + visible_start.saturating_sub(1) * gap;
-    render_chat_scrollbar(rows[1], buf, total_height, available, top_line);
+    render_chat_scrollbar(conversation_area, buf, total_height, available, top_line);
 
-    if app.chat_scroll > 0 && rows[1].width > 4 && rows[1].height > 0 {
+    if former_member && rows[1].height > 0 {
+        Paragraph::new("You are not a member of this group anymore")
+            .alignment(Alignment::Center)
+            .style(
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::ITALIC),
+            )
+            .render(
+                Rect::new(rows[1].x, rows[1].bottom() - 1, rows[1].width, 1),
+                buf,
+            );
+    }
+
+    if app.chat_scroll > 0 && conversation_area.width > 4 && conversation_area.height > 0 {
         let label = if app.new_messages_below > 0 {
             format!(" ↓ {} new ", app.new_messages_below)
         } else {
             " ↓ latest ".into()
         };
         let width = u16::try_from(label.chars().count())
-            .unwrap_or(rows[1].width)
-            .min(rows[1].width);
+            .unwrap_or(conversation_area.width)
+            .min(conversation_area.width);
         let jump_area = Rect::new(
-            rows[1].right().saturating_sub(width),
-            rows[1].bottom().saturating_sub(1),
+            conversation_area.right().saturating_sub(width),
+            conversation_area.bottom().saturating_sub(1),
             width,
             1,
         );
@@ -687,18 +742,31 @@ fn render_chat(app: &App, area: Rect, buf: &mut Buffer) {
 
     let composer_columns =
         Layout::horizontal([Constraint::Min(10), Constraint::Length(10)]).split(rows[3]);
-    app.composer_area.set(composer_columns[0]);
-    app.send_area.set(composer_columns[1]);
-    let mut draft = app.composer.clone();
-    if app.composer_focused {
+    let writable = app.selected_chat_is_writable();
+    app.composer_area.set(if writable {
+        composer_columns[0]
+    } else {
+        Rect::default()
+    });
+    app.send_area.set(if writable {
+        composer_columns[1]
+    } else {
+        Rect::default()
+    });
+    let mut draft = if writable {
+        app.composer.clone()
+    } else {
+        "You are not a member of this group anymore".into()
+    };
+    if app.composer_focused && writable {
         draft.push('▏');
     }
     Paragraph::new(draft)
         .block(
             Block::bordered()
                 .border_type(BorderType::Rounded)
-                .title(" Message ")
-                .border_style(Style::default().fg(if app.composer_focused {
+                .title(if writable { " Message " } else { " Read only " })
+                .border_style(Style::default().fg(if app.composer_focused && writable {
                     Color::Cyan
                 } else {
                     Color::DarkGray
@@ -706,7 +774,7 @@ fn render_chat(app: &App, area: Rect, buf: &mut Buffer) {
         )
         .wrap(Wrap { trim: false })
         .render(composer_columns[0], buf);
-    let button_color = if app.sending {
+    let button_color = if app.sending || !writable {
         Color::DarkGray
     } else {
         Color::Rgb(40, 210, 130)
@@ -726,18 +794,160 @@ fn render_chat(app: &App, area: Rect, buf: &mut Buffer) {
         1.min(button_inner.height),
     );
     Paragraph::new(Span::styled(
-        if app.sending { "…" } else { "⌲" },
+        if !writable {
+            "×"
+        } else if app.sending {
+            "…"
+        } else {
+            "⌲"
+        },
         symbol_style,
     ))
     .alignment(Alignment::Center)
     .render(symbol_area, buf);
 
     if let Some(footer) = rows.last() {
-        Paragraph::new("Enter: send · Shift+Enter: newline · s: chat settings · PgUp/PgDn: scroll")
-            .alignment(Alignment::Center)
-            .fg(Color::DarkGray)
-            .render(*footer, buf);
+        Paragraph::new(if summary.chat_ref.0.starts_with('#') {
+            "Enter: send · Shift+Enter: newline · g: new group · m: group · s: chat settings · PgUp/PgDn: scroll"
+        } else {
+            "Enter: send · Shift+Enter: newline · g: new group · s: chat settings · PgUp/PgDn: scroll"
+        })
+        .alignment(Alignment::Center)
+        .fg(Color::DarkGray)
+        .render(*footer, buf);
     }
+}
+
+fn render_group_management(app: &App, area: Rect, buf: &mut Buffer) {
+    let Some(dialog) = &app.group_management_dialog else {
+        return;
+    };
+    let group_name = app
+        .chats
+        .iter()
+        .find(|chat| chat.chat_ref == dialog.chat_ref)
+        .map_or("Group", |chat| chat.display_name.as_str());
+    let popup = centered_rect(area, 72, 24);
+    Clear.render(popup, buf);
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(format!(" Group members · {group_name} "))
+        .padding(Padding::new(2, 2, 1, 1));
+    let inner = block.inner(popup);
+    block.render(popup, buf);
+    if app.input_mode == InputMode::RenameGroup {
+        Paragraph::new(format!(
+            "Rename group\n\nGroup name\n{}▏\n\nEnter: save · Esc: cancel",
+            app.input
+        ))
+        .wrap(Wrap { trim: false })
+        .render(inner, buf);
+        return;
+    }
+    if dialog.pending {
+        Paragraph::new("Updating group…\n\nEsc: close")
+            .wrap(Wrap { trim: false })
+            .render(inner, buf);
+        return;
+    }
+    let (title, entries): (&str, Vec<String>) = if dialog.adding {
+        (
+            "Select a contact to invite",
+            app.group_contacts()
+                .into_iter()
+                .map(|(_, name)| name)
+                .collect(),
+        )
+    } else {
+        (
+            "Members",
+            dialog
+                .members
+                .iter()
+                .map(|member| {
+                    format!(
+                        "{}  [{}]{}",
+                        member.display_name,
+                        member.role,
+                        if member.is_self { "  (you)" } else { "" }
+                    )
+                })
+                .collect(),
+        )
+    };
+    let mut lines = vec![Line::from(Span::styled(
+        title,
+        Style::default().add_modifier(Modifier::BOLD),
+    ))];
+    if entries.is_empty() {
+        lines.push(Line::from("  No entries available"));
+    } else {
+        lines.extend(entries.into_iter().enumerate().map(|(index, entry)| {
+            Line::from(Span::styled(
+                format!(
+                    "{} {entry}",
+                    if index == dialog.selected { "●" } else { " " }
+                ),
+                if index == dialog.selected {
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default()
+                },
+            ))
+        }));
+    }
+    lines.push(Line::from(""));
+    let is_owner = dialog
+        .members
+        .iter()
+        .any(|member| member.is_self && member.role == "owner");
+    lines.push(Line::from(if dialog.adding {
+        "↑/↓: select · Enter: invite · Esc: back"
+    } else if is_owner {
+        "a: add · r: rename · d: remove · l: leave · x: delete group · Esc: close"
+    } else {
+        "l: leave · x: delete locally · Esc: close"
+    }));
+    if let Some(error) = &dialog.error {
+        lines.push(Line::from(Span::styled(
+            error,
+            Style::default().fg(Color::Red),
+        )));
+    }
+    Paragraph::new(lines)
+        .wrap(Wrap { trim: false })
+        .render(inner, buf);
+}
+
+fn render_group_confirmation(app: &App, area: Rect, buf: &mut Buffer) {
+    let Some(confirmation) = &app.group_confirmation else {
+        return;
+    };
+    let action = match &confirmation.action {
+        GroupAction::Remove { name, .. } => format!("remove {name} from the group"),
+        GroupAction::Leave => "leave the group".into(),
+        GroupAction::Delete => "permanently delete the group".into(),
+        GroupAction::DeleteLocal => "delete the group locally".into(),
+    };
+    let popup = centered_rect(area, 68, 11);
+    Clear.render(popup, buf);
+    Paragraph::new(format!(
+        "Are you sure you want to {action} “{}”?\n\nNo: Enter/Esc · Yes: y",
+        confirmation.group_name
+    ))
+    .alignment(Alignment::Center)
+    .block(
+        Block::bordered()
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(Color::LightRed))
+            .title(" Confirm group action ")
+            .padding(Padding::new(2, 2, 1, 1)),
+    )
+    .wrap(Wrap { trim: false })
+    .render(popup, buf);
 }
 
 fn bubble_size(
@@ -760,9 +970,11 @@ fn bubble_size(
         .map(|line| UnicodeWidthStr::width(line).max(1).div_ceil(content_width))
         .sum::<usize>()
         .max(1);
+    let invitation_rows = usize::from(text.starts_with("You have been invited to join the group"));
     let height = u16::try_from(
         content_height
             .saturating_add(2)
+            .saturating_add(invitation_rows)
             .saturating_add(usize::from(has_reactions)),
     )
     .unwrap_or(u16::MAX);
@@ -805,11 +1017,16 @@ fn render_message_bubbles(
         } else {
             area.x
         };
-        let reaction_height = u16::from(!message.reactions.is_empty());
+        let reaction_height =
+            u16::from(!message.reactions.is_empty() || message.group_invitation.is_some());
         let frame_height = height.saturating_sub(reaction_height);
         let bubble_area = Rect::new(x, y, width, frame_height);
         let time = message.timestamp.get(11..16).unwrap_or("");
-        let sender = if message.outgoing { "You" } else { peer };
+        let sender = if message.outgoing {
+            "You"
+        } else {
+            message.sender_name.as_deref().unwrap_or(peer)
+        };
         let color = if message.outgoing {
             Color::Rgb(40, 210, 130)
         } else {
@@ -827,6 +1044,42 @@ fn render_message_bubbles(
             .block(bubble)
             .wrap(Wrap { trim: false })
             .render(bubble_area, buf);
+        if let Some(invitation) = &message.group_invitation
+            && frame_height >= 2
+        {
+            let button_y = bubble_area.bottom();
+            let reject = Rect::new(bubble_area.right().saturating_sub(7), button_y, 3, 1);
+            let accept = Rect::new(bubble_area.right().saturating_sub(3), button_y, 2, 1);
+            Paragraph::new("✕")
+                .alignment(Alignment::Center)
+                .style(
+                    Style::default()
+                        .fg(Color::LightRed)
+                        .add_modifier(Modifier::BOLD),
+                )
+                .render(reject, buf);
+            Paragraph::new("✓")
+                .alignment(Alignment::Center)
+                .style(
+                    Style::default()
+                        .fg(Color::LightGreen)
+                        .add_modifier(Modifier::BOLD),
+                )
+                .render(accept, buf);
+            let mut hitboxes = app.group_invitation_hitboxes.borrow_mut();
+            hitboxes.push(crate::app::GroupInvitationHitbox {
+                area: reject,
+                item_id: message.id,
+                group_id: invitation.group_id,
+                accept: false,
+            });
+            hitboxes.push(crate::app::GroupInvitationHitbox {
+                area: accept,
+                item_id: message.id,
+                group_id: invitation.group_id,
+                accept: true,
+            });
+        }
         app.message_hitboxes
             .borrow_mut()
             .push(crate::app::MessageHitbox {

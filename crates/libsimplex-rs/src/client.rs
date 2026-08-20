@@ -65,6 +65,43 @@ pub enum SimplexCommand {
         chat_ref: ChatRef,
         mode: ChatDeleteMode,
     },
+    CreateGroup {
+        user_id: i64,
+        name: String,
+    },
+    LoadGroupMembers(ChatRef),
+    AddGroupMember {
+        chat_ref: ChatRef,
+        contact_id: i64,
+    },
+    RemoveGroupMember {
+        chat_ref: ChatRef,
+        member_id: i64,
+    },
+    RenameGroup {
+        user_id: i64,
+        chat_ref: ChatRef,
+        name: String,
+    },
+    LeaveGroup {
+        user_id: i64,
+        chat_ref: ChatRef,
+    },
+    DeleteGroup {
+        user_id: i64,
+        chat_ref: ChatRef,
+    },
+    DeleteGroupLocally {
+        user_id: i64,
+        chat_ref: ChatRef,
+    },
+    AnswerGroupInvitation {
+        user_id: i64,
+        contact_chat_ref: ChatRef,
+        item_id: i64,
+        group_id: i64,
+        accept: bool,
+    },
     CreateInvitation {
         user_id: i64,
     },
@@ -436,6 +473,91 @@ fn command_loop(
                         .unwrap_or_else(SimplexEvent::ChatDeleteFailed);
                     sender.send(event).map_err(|e| e.to_string())?;
                 }
+                SimplexCommand::CreateGroup { user_id, name } => {
+                    let event = create_group(&controller, user_id, &name)
+                        .and_then(|chat_ref| {
+                            Ok(SimplexEvent::GroupCreated {
+                                chat_ref,
+                                chats: load_chats(&controller, user_id)?,
+                            })
+                        })
+                        .unwrap_or_else(SimplexEvent::GroupActionFailed);
+                    sender.send(event).map_err(|e| e.to_string())?;
+                }
+                SimplexCommand::LoadGroupMembers(chat_ref) => {
+                    let event = load_group_members(&controller, &chat_ref)
+                        .map(|members| SimplexEvent::GroupMembersLoaded { chat_ref, members })
+                        .unwrap_or_else(SimplexEvent::GroupActionFailed);
+                    sender.send(event).map_err(|e| e.to_string())?;
+                }
+                SimplexCommand::AddGroupMember {
+                    chat_ref,
+                    contact_id,
+                } => {
+                    let event = change_group_member(
+                        &controller,
+                        &chat_ref,
+                        &format!("/_add {} {contact_id} member", chat_ref.0),
+                        "Member invited",
+                    )
+                    .unwrap_or_else(SimplexEvent::GroupActionFailed);
+                    sender.send(event).map_err(|e| e.to_string())?;
+                }
+                SimplexCommand::RemoveGroupMember {
+                    chat_ref,
+                    member_id,
+                } => {
+                    let event = change_group_member(
+                        &controller,
+                        &chat_ref,
+                        &format!("/_remove {} {member_id} messages=off", chat_ref.0),
+                        "Member removed",
+                    )
+                    .unwrap_or_else(SimplexEvent::GroupActionFailed);
+                    sender.send(event).map_err(|e| e.to_string())?;
+                }
+                SimplexCommand::RenameGroup {
+                    user_id,
+                    chat_ref,
+                    name,
+                } => {
+                    let event = rename_group(&controller, user_id, &chat_ref, &name)
+                        .unwrap_or_else(SimplexEvent::GroupActionFailed);
+                    sender.send(event).map_err(|e| e.to_string())?;
+                }
+                SimplexCommand::LeaveGroup { user_id, chat_ref } => {
+                    let event = group_exit(&controller, user_id, &chat_ref, false)
+                        .unwrap_or_else(SimplexEvent::GroupActionFailed);
+                    sender.send(event).map_err(|e| e.to_string())?;
+                }
+                SimplexCommand::DeleteGroup { user_id, chat_ref } => {
+                    let event = group_exit(&controller, user_id, &chat_ref, true)
+                        .unwrap_or_else(SimplexEvent::GroupActionFailed);
+                    sender.send(event).map_err(|e| e.to_string())?;
+                }
+                SimplexCommand::DeleteGroupLocally { user_id, chat_ref } => {
+                    let event = group_delete_locally(&controller, user_id, &chat_ref)
+                        .unwrap_or_else(SimplexEvent::GroupActionFailed);
+                    sender.send(event).map_err(|e| e.to_string())?;
+                }
+                SimplexCommand::AnswerGroupInvitation {
+                    user_id,
+                    contact_chat_ref,
+                    item_id,
+                    group_id,
+                    accept,
+                } => {
+                    let event = answer_group_invitation(
+                        &controller,
+                        user_id,
+                        contact_chat_ref,
+                        item_id,
+                        group_id,
+                        accept,
+                    )
+                    .unwrap_or_else(SimplexEvent::GroupActionFailed);
+                    sender.send(event).map_err(|e| e.to_string())?;
+                }
                 SimplexCommand::CreateInvitation { user_id } => {
                     let event = controller
                         .command(&format!("/_connect {user_id} incognito=off"))
@@ -525,6 +647,19 @@ fn command_loop(
                 let chats = load_chats(&controller, user_id)?;
                 sender
                     .send(SimplexEvent::ContactConnected { chats, chat_ref })
+                    .map_err(|e| e.to_string())?;
+            }
+            if let Some(chat_ref) = model::deleted_group(&value) {
+                sender
+                    .send(SimplexEvent::GroupRemoved(chat_ref))
+                    .map_err(|e| e.to_string())?;
+            }
+            if let Some(user_id) = model::group_update_user(&value) {
+                sender
+                    .send(SimplexEvent::GroupListUpdated(load_chats(
+                        &controller,
+                        user_id,
+                    )?))
                     .map_err(|e| e.to_string())?;
             }
             for (chat_ref, message) in model::new_messages(&value) {
@@ -779,6 +914,15 @@ fn load_chat_deletion(
     })
 }
 
+fn load_chat_json(
+    controller: &crate::ffi::SimplexController,
+    chat_ref: &ChatRef,
+) -> Result<serde_json::Value, String> {
+    controller
+        .command(&format!("/_get chat {} count=1", chat_ref.0))
+        .map_err(|error| error.to_string())
+}
+
 fn update_chat_deletion(
     controller: &crate::ffi::SimplexController,
     user_id: i64,
@@ -913,6 +1057,196 @@ fn delete_chat(
         .map_err(|e| e.to_string())?;
     ensure_ok(&response, "chat deletion")?;
     load_chats(controller, user_id)
+}
+
+fn group_id(chat_ref: &ChatRef) -> Result<i64, String> {
+    chat_ref
+        .0
+        .strip_prefix('#')
+        .ok_or("group action requires a group chat")?
+        .parse()
+        .map_err(|_| "group chat has an invalid id".into())
+}
+
+fn create_group(
+    controller: &crate::ffi::SimplexController,
+    user_id: i64,
+    name: &str,
+) -> Result<ChatRef, String> {
+    let full_name = name.trim();
+    let display_name = simplex_display_name(full_name);
+    if display_name.is_empty() {
+        return Err("group name cannot be empty".into());
+    }
+    let profile = serde_json::json!({
+        "displayName": display_name,
+        "fullName": full_name,
+        "shortDescr": null,
+        "description": null,
+        "image": null,
+        "publicGroup": null,
+        "groupPreferences": {"calls": {"enable": "off"}},
+        "memberAdmission": null
+    });
+    let response = controller
+        .command(&format!("/_group {user_id} incognito=off {profile}"))
+        .map_err(|error| error.to_string())?;
+    model::created_group(&response)
+}
+
+fn load_group_members(
+    controller: &crate::ffi::SimplexController,
+    chat_ref: &ChatRef,
+) -> Result<Vec<model::GroupMember>, String> {
+    group_id(chat_ref)?;
+    model::group_members(
+        &controller
+            .command(&format!("/_members {}", chat_ref.0))
+            .map_err(|error| error.to_string())?,
+    )
+}
+
+fn change_group_member(
+    controller: &crate::ffi::SimplexController,
+    chat_ref: &ChatRef,
+    command: &str,
+    message: &str,
+) -> Result<SimplexEvent, String> {
+    group_id(chat_ref)?;
+    let response = controller
+        .command(command)
+        .map_err(|error| error.to_string())?;
+    ensure_ok(&response, "group member update")?;
+    Ok(SimplexEvent::GroupChanged {
+        chat_ref: chat_ref.clone(),
+        chats: Vec::new(),
+        members: load_group_members(controller, chat_ref)?,
+        message: message.into(),
+    })
+}
+
+fn rename_group(
+    controller: &crate::ffi::SimplexController,
+    user_id: i64,
+    chat_ref: &ChatRef,
+    name: &str,
+) -> Result<SimplexEvent, String> {
+    group_id(chat_ref)?;
+    let full_name = name.trim();
+    let display_name = simplex_display_name(full_name);
+    if display_name.is_empty() {
+        return Err("group name cannot be empty".into());
+    }
+    let chat = load_chat_json(controller, chat_ref)?;
+    let mut profile = chat
+        .pointer("/result/chat/chatInfo/groupInfo/groupProfile")
+        .cloned()
+        .ok_or("group chat has no group profile")?;
+    let profile_object = profile
+        .as_object_mut()
+        .ok_or("group profile is not an object")?;
+    profile_object.insert("displayName".into(), display_name.into());
+    profile_object.insert("fullName".into(), full_name.into());
+    let response = controller
+        .command(&format!("/_group_profile {} {profile}", chat_ref.0))
+        .map_err(|error| error.to_string())?;
+    ensure_ok(&response, "group name")?;
+    Ok(SimplexEvent::GroupChanged {
+        chat_ref: chat_ref.clone(),
+        chats: load_chats(controller, user_id)?,
+        members: load_group_members(controller, chat_ref)?,
+        message: "Group renamed".into(),
+    })
+}
+
+fn group_exit(
+    controller: &crate::ffi::SimplexController,
+    user_id: i64,
+    chat_ref: &ChatRef,
+    delete: bool,
+) -> Result<SimplexEvent, String> {
+    group_id(chat_ref)?;
+    let command = if delete {
+        format!("/_delete {} full notify=on", chat_ref.0)
+    } else {
+        format!("/_leave {}", chat_ref.0)
+    };
+    let response = controller
+        .command(&command)
+        .map_err(|error| error.to_string())?;
+    ensure_ok(
+        &response,
+        if delete {
+            "group deletion"
+        } else {
+            "leaving group"
+        },
+    )?;
+    Ok(SimplexEvent::GroupChanged {
+        chat_ref: chat_ref.clone(),
+        chats: load_chats(controller, user_id)?,
+        members: Vec::new(),
+        message: if delete {
+            "Group deleted"
+        } else {
+            "Group left"
+        }
+        .into(),
+    })
+}
+
+fn group_delete_locally(
+    controller: &crate::ffi::SimplexController,
+    user_id: i64,
+    chat_ref: &ChatRef,
+) -> Result<SimplexEvent, String> {
+    group_id(chat_ref)?;
+    let leave = controller
+        .command(&format!("/_leave {}", chat_ref.0))
+        .map_err(|error| error.to_string())?;
+    ensure_ok(&leave, "leaving group before local deletion")?;
+    let response = controller
+        .command(&format!("/_delete {} full notify=off", chat_ref.0))
+        .map_err(|error| error.to_string())?;
+    ensure_ok(&response, "local group deletion")?;
+    Ok(SimplexEvent::GroupChanged {
+        chat_ref: chat_ref.clone(),
+        chats: load_chats(controller, user_id)?,
+        members: Vec::new(),
+        message: "Group deleted locally".into(),
+    })
+}
+
+fn answer_group_invitation(
+    controller: &crate::ffi::SimplexController,
+    user_id: i64,
+    contact_chat_ref: ChatRef,
+    item_id: i64,
+    group_id: i64,
+    accept: bool,
+) -> Result<SimplexEvent, String> {
+    let action = if accept {
+        format!("/_join #{group_id}")
+    } else {
+        format!("/_delete #{group_id} full notify=on")
+    };
+    let response = controller
+        .command(&action)
+        .map_err(|error| error.to_string())?;
+    ensure_ok(
+        &response,
+        if accept {
+            "joining group"
+        } else {
+            "rejecting group invitation"
+        },
+    )?;
+    Ok(SimplexEvent::GroupInvitationAnswered {
+        contact_chat_ref,
+        item_id,
+        chats: load_chats(controller, user_id)?,
+        accepted: accept,
+    })
 }
 
 fn feature_name(feature: ChatFeature) -> &'static str {

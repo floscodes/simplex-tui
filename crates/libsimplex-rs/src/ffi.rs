@@ -396,6 +396,52 @@ mod tests {
             .and_then(Value::as_i64)
             .expect("created user id");
         controller.command("/_start").expect("start chat");
+        let group = controller
+            .command(&format!(
+                "/_group {user_id} incognito=off {{\"displayName\":\"Test Group\",\"fullName\":\"Test Group (Private)\",\"shortDescr\":null,\"description\":null,\"image\":null,\"publicGroup\":null,\"groupPreferences\":{{\"calls\":{{\"enable\":\"off\"}}}},\"memberAdmission\":null}}"
+            ))
+            .expect("create group");
+        let group_ref = crate::model::created_group(&group).expect("parse created group");
+        let renamed = controller
+            .command(&format!(
+                "/_group_profile {} {{\"displayName\":\"Renamed Group\",\"fullName\":\"Renamed Group (Private)\",\"groupPreferences\":{{}}}}",
+                group_ref.0
+            ))
+            .expect("rename group");
+        assert!(renamed.get("error").is_none(), "{renamed}");
+        let group_chats = controller
+            .command(&format!("/_get chats {user_id} pcc=on"))
+            .expect("list group chats");
+        assert!(
+            crate::model::chats(&group_chats)
+                .expect("parse group chats")
+                .iter()
+                .any(|chat| chat.chat_ref == group_ref
+                    && chat.display_name == "Renamed Group (Private)")
+        );
+        let members = controller
+            .command(&format!("/_members {}", group_ref.0))
+            .expect("list group members");
+        assert!(
+            crate::model::group_members(&members)
+                .expect("parse group members")
+                .iter()
+                .any(|member| member.is_self)
+        );
+        controller
+            .command(&format!("/_leave {}", group_ref.0))
+            .expect("leave group");
+        let disposable_group = controller
+            .command(&format!(
+                "/_group {user_id} incognito=off {{\"displayName\":\"Disposable Group\",\"fullName\":\"Disposable Group\",\"shortDescr\":null,\"description\":null,\"image\":null,\"publicGroup\":null,\"groupPreferences\":{{}},\"memberAdmission\":null}}"
+            ))
+            .expect("create disposable group");
+        let disposable_ref =
+            crate::model::created_group(&disposable_group).expect("parse disposable group");
+        let deleted = controller
+            .command(&format!("/_delete {} full notify=on", disposable_ref.0))
+            .expect("delete group");
+        assert!(deleted.get("error").is_none(), "{deleted}");
         let users = controller.command("/users").expect("list profiles");
         assert_eq!(
             users.pointer("/result/type").and_then(Value::as_str),

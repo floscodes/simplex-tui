@@ -45,10 +45,21 @@ pub struct ChatSummary {
     pub chat_ref: ChatRef,
     pub display_name: String,
     pub unread_count: u64,
+    pub group_status: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct ChatRef(pub String);
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GroupMember {
+    pub id: i64,
+    pub contact_id: Option<i64>,
+    pub display_name: String,
+    pub role: String,
+    pub status: String,
+    pub is_self: bool,
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Message {
@@ -56,8 +67,16 @@ pub struct Message {
     pub text: String,
     pub timestamp: String,
     pub outgoing: bool,
+    pub sender_name: Option<String>,
     pub reactions: Vec<MessageReaction>,
     pub attachment: Option<Attachment>,
+    pub group_invitation: Option<GroupInvitation>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GroupInvitation {
+    pub group_id: i64,
+    pub group_name: String,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -156,6 +175,29 @@ pub enum SimplexEvent {
         chats: Vec<ChatSummary>,
     },
     ChatDeleteFailed(String),
+    GroupCreated {
+        chat_ref: ChatRef,
+        chats: Vec<ChatSummary>,
+    },
+    GroupMembersLoaded {
+        chat_ref: ChatRef,
+        members: Vec<GroupMember>,
+    },
+    GroupChanged {
+        chat_ref: ChatRef,
+        chats: Vec<ChatSummary>,
+        members: Vec<GroupMember>,
+        message: String,
+    },
+    GroupActionFailed(String),
+    GroupInvitationAnswered {
+        contact_chat_ref: ChatRef,
+        item_id: i64,
+        chats: Vec<ChatSummary>,
+        accepted: bool,
+    },
+    GroupListUpdated(Vec<ChatSummary>),
+    GroupRemoved(ChatRef),
     FileDownloadStarted {
         file_id: i64,
         path: String,
@@ -347,6 +389,23 @@ pub fn connected_contact(value: &Value) -> Option<(i64, ChatRef)> {
     Some((user_id, ChatRef(format!("@{contact_id}"))))
 }
 
+pub fn group_update_user(value: &Value) -> Option<i64> {
+    let result = value.get("result")?;
+    (result.get("groupInfo").is_some() || result.get("group").is_some())
+        .then(|| result.pointer("/user/userId").and_then(Value::as_i64))?
+}
+
+pub fn deleted_group(value: &Value) -> Option<ChatRef> {
+    let result = value.get("result")?;
+    if result.get("type")?.as_str()? != "groupDeleted" {
+        return None;
+    }
+    Some(ChatRef(format!(
+        "#{}",
+        result.pointer("/groupInfo/groupId")?.as_i64()?
+    )))
+}
+
 pub fn reaction_change(value: &Value) -> Option<(ChatRef, i64, String, bool, bool)> {
     let result = value.get("result")?;
     if result.get("type")?.as_str()? != "chatItemReaction" {
@@ -489,6 +548,14 @@ pub fn chats(value: &Value) -> Result<Vec<ChatSummary>, String> {
             if info.get("type").and_then(Value::as_str) == Some("local") {
                 return false;
             }
+            if info.get("type").and_then(Value::as_str) == Some("group") {
+                let status = info
+                    .pointer("/groupInfo/membership/memberStatus")
+                    .and_then(Value::as_str);
+                if matches!(status, Some("invited" | "deleted")) {
+                    return false;
+                }
+            }
             info.pointer("/contact/localDisplayName")
                 .and_then(Value::as_str)
                 != Some("Ask SimpleX Team")
@@ -496,20 +563,26 @@ pub fn chats(value: &Value) -> Result<Vec<ChatSummary>, String> {
         .map(|chat| {
             let info = chat.get("chatInfo").ok_or("chat has no chatInfo")?;
             let chat_ref = chat_ref(info)?;
-            let display_name = [
-                "contact",
-                "groupInfo",
-                "noteFolder",
-                "contactRequest",
-                "contactConnection",
-            ]
-            .iter()
-            .find_map(|key| info.get(key))
-            .and_then(|info| info.get("localDisplayName"))
-            .and_then(Value::as_str)
-            .or_else(|| info.get("localDisplayName").and_then(Value::as_str))
-            .unwrap_or("Unknown chat")
-            .to_owned();
+            let display_name = info
+                .pointer("/groupInfo/groupProfile/fullName")
+                .and_then(Value::as_str)
+                .filter(|name| !name.is_empty())
+                .or_else(|| {
+                    [
+                        "contact",
+                        "groupInfo",
+                        "noteFolder",
+                        "contactRequest",
+                        "contactConnection",
+                    ]
+                    .iter()
+                    .find_map(|key| info.get(key))
+                    .and_then(|info| info.get("localDisplayName"))
+                    .and_then(Value::as_str)
+                })
+                .or_else(|| info.get("localDisplayName").and_then(Value::as_str))
+                .unwrap_or("Unknown chat")
+                .to_owned();
             let unread_count = chat
                 .pointer("/chatStats/unreadCount")
                 .and_then(Value::as_u64)
@@ -518,6 +591,73 @@ pub fn chats(value: &Value) -> Result<Vec<ChatSummary>, String> {
                 chat_ref,
                 display_name,
                 unread_count,
+                group_status: info
+                    .pointer("/groupInfo/membership/memberStatus")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+            })
+        })
+        .collect()
+}
+
+pub fn created_group(value: &Value) -> Result<ChatRef, String> {
+    let result = value
+        .get("result")
+        .ok_or_else(|| response_error(value, "group creation"))?;
+    if result.get("type").and_then(Value::as_str) != Some("groupCreated") {
+        return Err(response_error(value, "group creation"));
+    }
+    let id = result
+        .pointer("/groupInfo/groupId")
+        .and_then(Value::as_i64)
+        .ok_or("groupCreated response has no numeric groupId")?;
+    Ok(ChatRef(format!("#{id}")))
+}
+
+pub fn group_members(value: &Value) -> Result<Vec<GroupMember>, String> {
+    let result = value
+        .get("result")
+        .ok_or_else(|| response_error(value, "group members"))?;
+    if result.get("type").and_then(Value::as_str) != Some("groupMembers") {
+        return Err(response_error(value, "group members"));
+    }
+    let group = result
+        .get("group")
+        .ok_or("groupMembers response has no group")?;
+    let membership = group.pointer("/groupInfo/membership");
+    let members = group
+        .pointer("/group/members")
+        .or_else(|| group.get("members"))
+        .and_then(Value::as_array)
+        .ok_or("groupMembers response has no members array")?;
+    membership
+        .into_iter()
+        .chain(members)
+        .map(|member| {
+            Ok(GroupMember {
+                id: member
+                    .get("groupMemberId")
+                    .and_then(Value::as_i64)
+                    .ok_or("group member has no numeric groupMemberId")?,
+                contact_id: member.get("memberContactId").and_then(Value::as_i64),
+                display_name: member
+                    .pointer("/memberProfile/fullName")
+                    .and_then(Value::as_str)
+                    .filter(|name| !name.is_empty())
+                    .or_else(|| member.get("localDisplayName").and_then(Value::as_str))
+                    .unwrap_or("Unknown member")
+                    .to_owned(),
+                role: member
+                    .get("memberRole")
+                    .and_then(Value::as_str)
+                    .unwrap_or("member")
+                    .to_owned(),
+                status: member
+                    .get("memberStatus")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown")
+                    .to_owned(),
+                is_self: member.get("memberCategory").and_then(Value::as_str) == Some("user"),
             })
         })
         .collect()
@@ -580,6 +720,53 @@ fn chat_ref(info: &Value) -> Result<ChatRef, String> {
 }
 
 fn parse_message(item: &Value) -> Option<Message> {
+    if item.pointer("/content/type").and_then(Value::as_str) == Some("rcvGroupInvitation") {
+        let invitation = item.pointer("/content/groupInvitation")?;
+        if invitation.get("status").and_then(Value::as_str) != Some("pending") {
+            return None;
+        }
+        let meta = item.get("meta")?;
+        return Some(Message {
+            id: meta.get("itemId")?.as_i64()?,
+            text: format!(
+                "You have been invited to join the group “{}”.",
+                invitation
+                    .pointer("/groupProfile/fullName")
+                    .and_then(Value::as_str)
+                    .filter(|name| !name.is_empty())
+                    .or_else(|| invitation
+                        .pointer("/groupProfile/displayName")
+                        .and_then(Value::as_str))
+                    .unwrap_or("Group")
+            ),
+            timestamp: meta
+                .get("itemTs")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_owned(),
+            outgoing: false,
+            sender_name: invitation
+                .pointer("/invitedBy/memberProfile/displayName")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            reactions: Vec::new(),
+            attachment: None,
+            group_invitation: Some(GroupInvitation {
+                group_id: invitation.get("groupId")?.as_i64()?,
+                group_name: invitation
+                    .pointer("/groupProfile/fullName")
+                    .and_then(Value::as_str)
+                    .filter(|name| !name.is_empty())
+                    .or_else(|| {
+                        invitation
+                            .pointer("/groupProfile/displayName")
+                            .and_then(Value::as_str)
+                    })
+                    .unwrap_or("Group")
+                    .to_owned(),
+            }),
+        });
+    }
     if !matches!(
         item.pointer("/content/type").and_then(Value::as_str),
         Some("sndMsgContent" | "rcvMsgContent")
@@ -614,6 +801,10 @@ fn parse_message(item: &Value) -> Option<Message> {
             .unwrap_or("")
             .to_owned(),
         outgoing: direction.to_ascii_lowercase().contains("snd"),
+        sender_name: item
+            .pointer("/chatDir/groupMember/memberProfile/displayName")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
         reactions: item
             .get("reactions")
             .and_then(Value::as_array)
@@ -631,6 +822,7 @@ fn parse_message(item: &Value) -> Option<Message> {
             })
             .collect(),
         attachment,
+        group_invitation: None,
     })
 }
 
@@ -760,8 +952,52 @@ mod tests {
             vec![ChatSummary {
                 chat_ref: ChatRef("@9".into()),
                 display_name: "bob".into(),
-                unread_count: 3
+                unread_count: 3,
+                group_status: None,
             }]
+        );
+    }
+
+    #[test]
+    fn hides_pending_groups_and_parses_the_invitation_in_the_contact_chat() {
+        let parsed = chats(&json!({"result": {"type": "apiChats", "chats": [{
+            "chatInfo": {"type": "group", "groupInfo": {"groupId": 44,
+                "localDisplayName": "Invited", "membership": {"memberStatus": "invited"}}},
+            "chatStats": {"unreadCount": 0}
+        }, {
+            "chatInfo": {"type": "group", "groupInfo": {"groupId": 45,
+                "localDisplayName": "Deleted", "membership": {"memberStatus": "deleted"}}},
+            "chatStats": {"unreadCount": 0}
+        }, {
+            "chatInfo": {"type": "group", "groupInfo": {"groupId": 46,
+                "localDisplayName": "Left", "membership": {"memberStatus": "left"}}},
+            "chatStats": {"unreadCount": 0}
+        }, {
+            "chatInfo": {"type": "group", "groupInfo": {"groupId": 47,
+                "localDisplayName": "Removed", "membership": {"memberStatus": "removed"}}},
+            "chatStats": {"unreadCount": 0}
+        }]}}))
+        .unwrap();
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].chat_ref, ChatRef("#46".into()));
+        assert_eq!(parsed[0].group_status.as_deref(), Some("left"));
+        assert_eq!(parsed[1].group_status.as_deref(), Some("removed"));
+
+        let invitation = parse_message(&json!({
+            "chatDir": {"type": "directRcv"},
+            "content": {"type": "rcvGroupInvitation", "groupInvitation": {
+                "groupId": 44, "status": "pending",
+                "groupProfile": {"displayName": "Friends", "fullName": "Friends of Vienna"}
+            }},
+            "meta": {"itemId": 91, "itemTs": "2026-08-20T10:00:00Z"}
+        }))
+        .unwrap();
+        assert_eq!(
+            invitation.group_invitation,
+            Some(GroupInvitation {
+                group_id: 44,
+                group_name: "Friends of Vienna".into(),
+            })
         );
     }
 
@@ -780,6 +1016,16 @@ mod tests {
         assert_eq!(chat_ref, ChatRef("@9".into()));
         assert!(messages[0].outgoing);
         assert_eq!(messages[0].text, "hello");
+
+        let group_message = parse_message(&json!({
+            "chatDir": {"type": "groupRcv", "groupMember": {
+                "memberProfile": {"displayName": "Bob"}
+            }},
+            "content": {"type": "rcvMsgContent", "msgContent": {"type": "text", "text": "hi"}},
+            "meta": {"itemId": 13, "itemText": "hi", "itemTs": "2026-08-16T10:01:00Z"}
+        }))
+        .unwrap();
+        assert_eq!(group_message.sender_name.as_deref(), Some("Bob"));
     }
 
     #[test]
@@ -915,6 +1161,18 @@ mod tests {
     }
 
     #[test]
+    fn recognizes_a_group_deleted_by_its_owner() {
+        assert_eq!(
+            deleted_group(&json!({"result": {
+                "type": "groupDeleted",
+                "user": {"userId": 4},
+                "groupInfo": {"groupId": 27}
+            }})),
+            Some(ChatRef("#27".into()))
+        );
+    }
+
+    #[test]
     fn parses_message_reactions_and_live_reaction_changes() {
         let item = json!({
             "chatDir": {"type": "directRcv"},
@@ -991,5 +1249,44 @@ mod tests {
         assert_eq!(chat_ref, ChatRef("@7".into()));
         assert_eq!(updated.id, 33);
         assert_eq!(updated.attachment.unwrap().progress, Some(25));
+    }
+
+    #[test]
+    fn parses_group_creation_and_membership() {
+        assert_eq!(
+            created_group(&json!({"result": {
+                "type": "groupCreated", "groupInfo": {"groupId": 7}
+            }}))
+            .unwrap(),
+            ChatRef("#7".into())
+        );
+        let members = group_members(&json!({"result": {
+            "type": "groupMembers",
+            "group": {
+                "groupInfo": {"membership": {
+                    "groupMemberId": 1,
+                    "memberCategory": "user",
+                    "memberRole": "owner",
+                    "memberStatus": "creator",
+                    "localDisplayName": "Alice",
+                    "memberProfile": {"fullName": "Alice Example"}
+                }},
+                "members": [{
+                    "groupMemberId": 2,
+                    "memberContactId": 22,
+                    "memberCategory": "post",
+                    "memberRole": "member",
+                    "memberStatus": "connected",
+                    "localDisplayName": "Bob",
+                    "memberProfile": {"fullName": ""}
+                }]
+            }
+        }}))
+        .unwrap();
+        assert_eq!(members.len(), 2);
+        assert!(members[0].is_self);
+        assert_eq!(members[0].display_name, "Alice Example");
+        assert_eq!(members[1].display_name, "Bob");
+        assert_eq!(members[1].contact_id, Some(22));
     }
 }
