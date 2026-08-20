@@ -24,10 +24,32 @@ if (-not $Ghcup) {
 if (-not $Ghcup) { throw "GHCup installation did not produce ghcup.exe." }
 $GhcupExe = $Ghcup.Source
 
-& $GhcupExe whereis ghc $GhcVersion *> $null
-if ($LASTEXITCODE -ne 0) { & $GhcupExe install ghc $GhcVersion --no-set }
-& $GhcupExe whereis cabal $CabalVersion *> $null
-if ($LASTEXITCODE -ne 0) { & $GhcupExe install cabal $CabalVersion --no-set }
+function Test-GhcupToolInstalled {
+    param(
+        [Parameter(Mandatory)] [string] $Tool,
+        [Parameter(Mandatory)] [string] $Version
+    )
+
+    # `ghcup whereis` reports a missing tool on stderr. Windows PowerShell turns
+    # that expected result into a terminating NativeCommandError while the
+    # script-wide ErrorActionPreference is Stop, so relax it for this probe.
+    $PreviousErrorActionPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = "Continue"
+        & $GhcupExe whereis $Tool $Version *> $null
+        return $LASTEXITCODE -eq 0
+    }
+    finally {
+        $ErrorActionPreference = $PreviousErrorActionPreference
+    }
+}
+
+if (-not (Test-GhcupToolInstalled -Tool "ghc" -Version $GhcVersion)) {
+    & $GhcupExe install ghc $GhcVersion --no-set
+}
+if (-not (Test-GhcupToolInstalled -Tool "cabal" -Version $CabalVersion)) {
+    & $GhcupExe install cabal $CabalVersion --no-set
+}
 
 $MsysDir = [Environment]::GetEnvironmentVariable("GHCUP_MSYS2", "User")
 if (-not $MsysDir) { $MsysDir = Join-Path ${env:SystemDrive} "ghcup\msys64" }
