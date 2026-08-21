@@ -87,9 +87,11 @@ $env:SIMPLEX_ROOT = $RootDir
 $env:SIMPLEX_GHCUP = $GhcupExe
 $env:SIMPLEX_GHC = (& $GhcupExe whereis ghc $GhcVersion).Trim()
 $env:SIMPLEX_CABAL = (& $GhcupExe whereis cabal $CabalVersion).Trim()
+$env:SIMPLEX_GHC_BIN = Split-Path -Parent $env:SIMPLEX_GHC
+$env:SIMPLEX_CABAL_BIN = Split-Path -Parent $env:SIMPLEX_CABAL
 $RootUnix = (& $Bash -lc 'cygpath -u "$SIMPLEX_ROOT"').Trim()
-$GhcBinUnix = (& $Bash -lc 'dirname "$(cygpath -u "$SIMPLEX_GHC")"').Trim()
-$CabalBinUnix = (& $Bash -lc 'dirname "$(cygpath -u "$SIMPLEX_CABAL")"').Trim()
+$GhcBinUnix = (& $Bash -lc 'cygpath -u "$SIMPLEX_GHC_BIN"').Trim()
+$CabalBinUnix = (& $Bash -lc 'cygpath -u "$SIMPLEX_CABAL_BIN"').Trim()
 $build = "export PATH='${GhcBinUnix}:${CabalBinUnix}:/ucrt64/bin':`$PATH; cd '$RootUnix/vendor/simplex-chat'; cabal update && bash scripts/desktop/build-lib-windows.sh"
 & $Bash -lc $build
 if ($LASTEXITCODE -ne 0) { throw "The upstream SimpleX Windows build failed." }
