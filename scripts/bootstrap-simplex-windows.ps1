@@ -4,7 +4,7 @@ $RootDir = Split-Path -Parent $PSScriptRoot
 $SourceDir = Join-Path $RootDir "vendor\simplex-chat"
 $Revision = "ec6e975001861d494360cda4aa267747d3a14272"
 $GhcVersion = "9.6.3"
-$CabalVersion = "3.10.1.0"
+$CabalVersion = "3.16.1.0"
 
 if (-not [Environment]::Is64BitOperatingSystem) {
     throw "The SimpleX Windows build requires 64-bit Windows."
