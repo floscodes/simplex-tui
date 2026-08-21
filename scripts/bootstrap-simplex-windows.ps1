@@ -10,12 +10,26 @@ if (-not [Environment]::Is64BitOperatingSystem) {
     throw "The SimpleX Windows build requires 64-bit Windows."
 }
 
-$Ghcup = Get-Command ghcup.exe -ErrorAction SilentlyContinue
-if (-not $Ghcup) {
-    Write-Host "Installing GHCup and MSYS2..."
+function Install-GhcupEnvironment {
+    Write-Host "Installing missing GHCup/MSYS2 components..."
     $bootstrap = Invoke-WebRequest "https://www.haskell.org/ghcup/sh/bootstrap-haskell.ps1" -UseBasicParsing
     & ([ScriptBlock]::Create($bootstrap.Content)) -Minimal -InBash -Msys2Env UCRT64 -DontWriteDesktopShortcuts
+}
+
+$Ghcup = Get-Command ghcup.exe -ErrorAction SilentlyContinue
+$MsysDir = [Environment]::GetEnvironmentVariable("GHCUP_MSYS2", "User")
+if (-not $MsysDir) { $MsysDir = Join-Path ${env:SystemDrive} "ghcup\msys64" }
+$Bash = Join-Path $MsysDir "usr\bin\bash.exe"
+
+# GitHub's Windows image may provide ghcup.exe without the companion MSYS2
+# installation. Run the bootstrap when either component is missing; it keeps an
+# existing GHCup installation and installs MSYS2 into the configured location.
+if (-not $Ghcup -or -not (Test-Path $Bash)) {
+    Install-GhcupEnvironment
     $Ghcup = Get-Command ghcup.exe -ErrorAction SilentlyContinue
+    $MsysDir = [Environment]::GetEnvironmentVariable("GHCUP_MSYS2", "User")
+    if (-not $MsysDir) { $MsysDir = Join-Path ${env:SystemDrive} "ghcup\msys64" }
+    $Bash = Join-Path $MsysDir "usr\bin\bash.exe"
 }
 if (-not $Ghcup) {
     $GhcupPath = Join-Path ${env:SystemDrive} "ghcup\bin\ghcup.exe"
@@ -51,9 +65,6 @@ if (-not (Test-GhcupToolInstalled -Tool "cabal" -Version $CabalVersion)) {
     & $GhcupExe install cabal $CabalVersion --no-set
 }
 
-$MsysDir = [Environment]::GetEnvironmentVariable("GHCUP_MSYS2", "User")
-if (-not $MsysDir) { $MsysDir = Join-Path ${env:SystemDrive} "ghcup\msys64" }
-$Bash = Join-Path $MsysDir "usr\bin\bash.exe"
 if (-not (Test-Path $Bash)) { throw "MSYS2 bash was not found at $Bash." }
 
 $env:MSYSTEM = "UCRT64"
