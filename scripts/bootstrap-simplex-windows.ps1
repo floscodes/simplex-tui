@@ -13,7 +13,11 @@ if (-not [Environment]::Is64BitOperatingSystem) {
 function Install-GhcupEnvironment {
     Write-Host "Installing missing GHCup/MSYS2 components..."
     $bootstrap = Invoke-WebRequest "https://www.haskell.org/ghcup/sh/bootstrap-haskell.ps1" -UseBasicParsing
-    & ([ScriptBlock]::Create($bootstrap.Content)) -Minimal -InBash -Msys2Env UCRT64 -DontWriteDesktopShortcuts
+    $bootstrapContent = $bootstrap.Content
+    if ($bootstrapContent -is [byte[]]) {
+        $bootstrapContent = [Text.Encoding]::UTF8.GetString($bootstrapContent)
+    }
+    & ([ScriptBlock]::Create([string] $bootstrapContent)) -Minimal -InBash -Msys2Env UCRT64 -DontWriteDesktopShortcuts
 }
 
 $Ghcup = Get-Command ghcup.exe -ErrorAction SilentlyContinue
