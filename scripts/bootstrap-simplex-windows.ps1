@@ -73,7 +73,7 @@ if (-not (Test-Path $Bash)) { throw "MSYS2 bash was not found at $Bash." }
 
 $env:MSYSTEM = "UCRT64"
 $env:CHERE_INVOKING = "1"
-& $Bash -lc "pacman --noconfirm -S --needed perl make mingw-w64-ucrt-x86_64-cmake mingw-w64-ucrt-x86_64-gcc"
+& $Bash -lc "pacman --noconfirm -S --needed git perl make mingw-w64-ucrt-x86_64-cmake mingw-w64-ucrt-x86_64-gcc"
 if ($LASTEXITCODE -ne 0) { throw "Installing MSYS2 build dependencies failed." }
 
 if (-not (Test-Path (Join-Path $SourceDir ".git"))) {
