@@ -107,8 +107,6 @@ respective licenses.
 
 ## License
 
-Copyright (c) floscodes <mail@floscodes.net>
-
 This project, including the `simplex-tui` and `libsimplex-rs` crates, is
 licensed under [GNU AGPL v3 only].
 
