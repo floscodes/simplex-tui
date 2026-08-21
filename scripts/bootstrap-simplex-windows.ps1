@@ -85,9 +85,12 @@ git -C $SourceDir checkout --detach $Revision
 
 $env:SIMPLEX_ROOT = $RootDir
 $env:SIMPLEX_GHCUP = $GhcupExe
+$env:SIMPLEX_GHC = (& $GhcupExe whereis ghc $GhcVersion).Trim()
+$env:SIMPLEX_CABAL = (& $GhcupExe whereis cabal $CabalVersion).Trim()
 $RootUnix = (& $Bash -lc 'cygpath -u "$SIMPLEX_ROOT"').Trim()
-$GhcupUnix = (& $Bash -lc 'cygpath -u "$SIMPLEX_GHCUP"').Trim()
-$build = "export PATH=/ucrt64/bin:`$PATH; cd '$RootUnix/vendor/simplex-chat'; '$GhcupUnix' run --ghc $GhcVersion --cabal $CabalVersion -- cabal update && '$GhcupUnix' run --ghc $GhcVersion --cabal $CabalVersion -- bash scripts/desktop/build-lib-windows.sh"
+$GhcBinUnix = (& $Bash -lc 'dirname "$(cygpath -u "$SIMPLEX_GHC")"').Trim()
+$CabalBinUnix = (& $Bash -lc 'dirname "$(cygpath -u "$SIMPLEX_CABAL")"').Trim()
+$build = "export PATH='${GhcBinUnix}:${CabalBinUnix}:/ucrt64/bin':`$PATH; cd '$RootUnix/vendor/simplex-chat'; cabal update && bash scripts/desktop/build-lib-windows.sh"
 & $Bash -lc $build
 if ($LASTEXITCODE -ne 0) { throw "The upstream SimpleX Windows build failed." }
 
