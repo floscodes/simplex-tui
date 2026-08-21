@@ -68,6 +68,10 @@ if (-not (Test-GhcupToolInstalled -Tool "ghc" -Version $GhcVersion)) {
 if (-not (Test-GhcupToolInstalled -Tool "cabal" -Version $CabalVersion)) {
     & $GhcupExe install cabal $CabalVersion --no-set
 }
+& $GhcupExe set ghc $GhcVersion
+if ($LASTEXITCODE -ne 0) { throw "Selecting GHC $GhcVersion failed." }
+& $GhcupExe set cabal $CabalVersion
+if ($LASTEXITCODE -ne 0) { throw "Selecting Cabal $CabalVersion failed." }
 
 if (-not (Test-Path $Bash)) { throw "MSYS2 bash was not found at $Bash." }
 

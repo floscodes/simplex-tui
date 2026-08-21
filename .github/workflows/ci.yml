@@ -19,6 +19,7 @@ concurrency:
 
 jobs:
   fmt:
+    if: ${{ !contains(github.event.head_commit.message, '[windows-only]') }}
     name: fmt
     runs-on: ubuntu-latest
     steps:
@@ -33,6 +34,7 @@ jobs:
       - name: Cache Cargo dependencies
         uses: Swatinem/rust-cache@v2
   clippy:
+    if: ${{ !contains(github.event.head_commit.message, '[windows-only]') }}
     name: clippy
     runs-on: ubuntu-latest
     permissions:
@@ -50,6 +52,7 @@ jobs:
       - name: Cache Cargo dependencies
         uses: Swatinem/rust-cache@v2
   doc:
+    if: ${{ !contains(github.event.head_commit.message, '[windows-only]') }}
     # run docs generation on nightly rather than stable. This enables features like
     # https://doc.rust-lang.org/beta/unstable-book/language-features/doc-cfg.html which allows an
     # API be documented as only available in some specific platforms.
@@ -69,7 +72,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-latest, windows-latest]
+        os: ${{ fromJSON(contains(github.event.head_commit.message, '[windows-only]') && '["windows-latest"]' || '["macos-latest", "windows-latest"]') }}
     steps:
       # if your project needs OpenSSL, uncomment this to fix Windows builds.
       # it's commented out by default as the install command takes 5-10m.
