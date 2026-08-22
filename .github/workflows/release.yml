@@ -12,19 +12,9 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  build-unix:
-    name: Build ${{ matrix.asset }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-24.04
-            asset: simplex-tui-linux-x86_64
-          - os: macos-15
-            asset: simplex-tui-macos-aarch64
-          - os: macos-15-intel
-            asset: simplex-tui-macos-x86_64
-    runs-on: ${{ matrix.os }}
+  build-linux:
+    name: Build simplex-tui-linux-x86_64
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -32,30 +22,83 @@ jobs:
         run: cargo build --locked --release -p simplex-tui
       - name: Package release
         env:
-          ASSET: ${{ matrix.asset }}
+          ASSET: simplex-tui-linux-x86_64
         run: |
           set -euo pipefail
           package="dist/$ASSET"
           mkdir -p "$package"
           cp target/release/simplex-tui "$package/"
           cp README.md LICENSE "$package/"
-          if [[ "${{ runner.os }}" == "Linux" ]]; then
-            cp vendor/libsimplex/*.so "$package/"
-          else
-            cp vendor/libsimplex/*.dylib "$package/"
-          fi
+          cp vendor/libsimplex/*.so "$package/"
           tar -C dist -czf "dist/$ASSET.tar.gz" "$ASSET"
-          if command -v sha256sum >/dev/null 2>&1; then
-            (cd dist && sha256sum "$ASSET.tar.gz" > "$ASSET.tar.gz.sha256")
-          else
-            (cd dist && shasum -a 256 "$ASSET.tar.gz" > "$ASSET.tar.gz.sha256")
-          fi
+          (cd dist && sha256sum "$ASSET.tar.gz" > "$ASSET.tar.gz.sha256")
       - uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.asset }}
+          name: release-linux
           path: |
-            dist/${{ matrix.asset }}.tar.gz
-            dist/${{ matrix.asset }}.tar.gz.sha256
+            dist/simplex-tui-linux-x86_64.tar.gz
+            dist/simplex-tui-linux-x86_64.tar.gz.sha256
+          if-no-files-found: error
+
+  build-macos:
+    name: Build macOS ${{ matrix.arch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15
+            arch: aarch64
+          - os: macos-15-intel
+            arch: x86_64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build application and native SimpleX library
+        run: cargo build --locked --release -p simplex-tui
+      - name: Stage architecture files
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp target/release/simplex-tui "dist/simplex-tui-$ARCH"
+          cp vendor/libsimplex/libsimplex.dylib "dist/libsimplex-$ARCH.dylib"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: raw-macos-${{ matrix.arch }}
+          path: dist/*
+          if-no-files-found: error
+
+  package-macos:
+    name: Package simplex-tui-macos-universal
+    needs: build-macos
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: raw-macos-*
+          path: dist/raw
+          merge-multiple: true
+      - name: Create universal macOS package
+        run: |
+          set -euo pipefail
+          asset="simplex-tui-macos-universal"
+          package="dist/$asset"
+          mkdir -p "$package"
+          lipo -create dist/raw/simplex-tui-aarch64 dist/raw/simplex-tui-x86_64 -output "$package/simplex-tui"
+          lipo -create dist/raw/libsimplex-aarch64.dylib dist/raw/libsimplex-x86_64.dylib -output "$package/libsimplex.dylib"
+          chmod +x "$package/simplex-tui"
+          cp README.md LICENSE "$package/"
+          tar -C dist -czf "dist/$asset.tar.gz" "$asset"
+          (cd dist && shasum -a 256 "$asset.tar.gz" > "$asset.tar.gz.sha256")
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-macos
+          path: |
+            dist/simplex-tui-macos-universal.tar.gz
+            dist/simplex-tui-macos-universal.tar.gz.sha256
           if-no-files-found: error
 
   build-windows:
@@ -81,7 +124,7 @@ jobs:
           "$Hash  $Asset.zip" | Set-Content -NoNewline "$Archive.sha256"
       - uses: actions/upload-artifact@v4
         with:
-          name: simplex-tui-windows-x86_64
+          name: release-windows
           path: |
             dist/simplex-tui-windows-x86_64.zip
             dist/simplex-tui-windows-x86_64.zip.sha256
@@ -89,12 +132,13 @@ jobs:
 
   publish:
     name: Publish GitHub release
-    needs: [build-unix, build-windows]
+    needs: [build-linux, package-macos, build-windows]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
+          pattern: release-*
           path: dist
           merge-multiple: true
       - name: Create release through the GitHub API

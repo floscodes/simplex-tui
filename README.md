@@ -6,6 +6,64 @@
   <img src="./screenshot.png" alt="simplex-tui chat interface" width="900">
 </p>
 
+## Downloads
+
+Each [GitHub release](https://github.com/floscodes/simplex-tui/releases) provides
+portable packages for Linux x86_64, universal macOS (Apple Silicon and Intel),
+and Windows x86_64. No installation is required: download and extract the
+archive for your platform, then run `simplex-tui` (`simplex-tui.exe` on
+Windows) directly from the extracted directory. Keep the included `libsimplex`
+library beside the executable.
+
+SHA-256 checksum files are published alongside all three archives.
+
+### Windows
+
+1. Download `simplex-tui-windows-x86_64.zip`.
+2. In File Explorer, right-click the ZIP file and select **Extract All**.
+3. Open the extracted directory and run `simplex-tui.exe`.
+
+Do not run the executable from inside the ZIP preview. Keep
+`libsimplex.dll` in the same directory as `simplex-tui.exe`.
+
+To run `simplex-tui` from any terminal, move the complete extracted directory
+to a permanent location, such as `%LOCALAPPDATA%\simplex-tui`, and add that
+directory to your user `Path` in **System Properties → Environment Variables**.
+This is optional; without it, start the executable from its directory.
+
+### Linux
+
+```bash
+tar -xzf simplex-tui-linux-x86_64.tar.gz
+cd simplex-tui-linux-x86_64
+./simplex-tui
+```
+
+Keep `libsimplex.so` in the extracted directory beside `simplex-tui`.
+
+To run `simplex-tui` from any directory, place both files in a directory on
+your `PATH`. A common per-user location is `~/.local/bin`:
+
+```bash
+mkdir -p ~/.local/bin
+cp simplex-tui libsimplex.so ~/.local/bin/
+```
+
+If `~/.local/bin` is not already on your `PATH`, add it in your shell profile.
+This is optional; you can always run `./simplex-tui` from the extracted
+directory instead.
+
+### macOS
+
+```bash
+tar -xzf simplex-tui-macos-universal.tar.gz
+cd simplex-tui-macos-universal
+./simplex-tui
+```
+
+The universal package runs on Apple Silicon and Intel Macs. Keep
+`libsimplex.dylib` in the extracted directory beside `simplex-tui`.
+
 ## Installation
 
 ### Build from source
@@ -44,8 +102,6 @@ macOS, and 64-bit Windows.
 
    On Windows, run `target\release\simplex-tui.exe` instead. Application data
    is stored in `~/.simplex-tui`.
-
-Precompiled binaries will be available soon.
 
 [Ratatui]: https://ratatui.rs
 [event driven async template]: https://github.com/ratatui/templates/tree/main/event-driven-async
