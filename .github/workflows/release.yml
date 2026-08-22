@@ -16,7 +16,7 @@ jobs:
     name: Build simplex-tui-linux-x86_64
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - name: Build application and native SimpleX library
         run: cargo build --locked --release -p simplex-tui
@@ -52,7 +52,7 @@ jobs:
             arch: x86_64
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - name: Build application and native SimpleX library
         run: cargo build --locked --release -p simplex-tui
@@ -75,7 +75,7 @@ jobs:
     needs: build-macos
     runs-on: macos-15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/download-artifact@v4
         with:
           pattern: raw-macos-*
@@ -105,7 +105,7 @@ jobs:
     name: Build simplex-tui-windows-x86_64
     runs-on: windows-2025
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - name: Build application and native SimpleX library
         run: cargo build --locked --release -p simplex-tui
@@ -135,7 +135,7 @@ jobs:
     needs: [build-linux, package-macos, build-windows]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/download-artifact@v4
         with:
           pattern: release-*
