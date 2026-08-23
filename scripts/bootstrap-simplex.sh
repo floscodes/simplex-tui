@@ -5,6 +5,7 @@ root_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source_dir="$root_dir/vendor/simplex-chat"
 simplex_chat_revision="ec6e975001861d494360cda4aa267747d3a14272"
 required_ghc="9.6.3"
+required_cabal="3.16.1.0"
 
 install_system_dependencies() {
   if ! command -v apt-get >/dev/null 2>&1; then
@@ -76,8 +77,8 @@ fi
 if ! ghcup whereis ghc "$required_ghc" >/dev/null 2>&1; then
   ghcup install ghc "$required_ghc" --no-set
 fi
-if ! command -v cabal >/dev/null 2>&1; then
-  ghcup install cabal --set
+if ! ghcup whereis cabal "$required_cabal" >/dev/null 2>&1; then
+  ghcup install cabal "$required_cabal" --no-set
 fi
 
 if [[ ! -d "$source_dir/.git" ]]; then
@@ -89,8 +90,8 @@ git -C "$source_dir" fetch origin stable
 git -C "$source_dir" checkout --detach "$simplex_chat_revision"
 
 cd "$source_dir"
-ghcup run --ghc "$required_ghc" -- cabal update
-ghcup run --ghc "$required_ghc" -- scripts/desktop/build-lib-linux.sh
+ghcup run --ghc "$required_ghc" --cabal "$required_cabal" -- cabal update
+ghcup run --ghc "$required_ghc" --cabal "$required_cabal" -- scripts/desktop/build-lib-linux.sh
 
 arch="$(uname -m)"
 build_dir="$(find "dist-newstyle/build/${arch}-linux" -path '*/simplex-chat-*/build/libsimplex.so' -printf '%h\n' -quit)"
