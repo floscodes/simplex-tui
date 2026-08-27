@@ -766,7 +766,7 @@ dependencies = [
 
 [[package]]
 name = "libsimplex-rs"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "libc",
  "libloading",
@@ -1489,7 +1489,7 @@ dependencies = [
 
 [[package]]
 name = "simplex-tui"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "color-eyre",
  "crossterm",

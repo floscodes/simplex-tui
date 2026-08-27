@@ -1,6 +1,6 @@
 [package]
 name = "simplex-tui"
-version = "0.1.1"
+version = "0.1.2"
 description = "Terminal client for SimpleX Chat"
 edition.workspace = true
 license.workspace = true

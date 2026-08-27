@@ -66,20 +66,24 @@ async fn run(
     data_directory: std::path::PathBuf,
 ) -> color_eyre::Result<()> {
     let terminal = ratatui::init();
-    execute!(
-        stdout(),
-        EnableMouseCapture,
-        EnableBracketedPaste,
-        PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
-    )?;
-    let result = App::new(session, data_directory).run(terminal).await;
-    let input_result = execute!(
-        stdout(),
-        PopKeyboardEnhancementFlags,
-        DisableBracketedPaste,
-        DisableMouseCapture
+    let supports_keyboard_enhancement = matches!(
+        crossterm::terminal::supports_keyboard_enhancement(),
+        Ok(true)
     );
+    execute!(stdout(), EnableMouseCapture, EnableBracketedPaste)?;
+    if supports_keyboard_enhancement {
+        execute!(
+            stdout(),
+            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+        )?;
+    }
+    let result = App::new(session, data_directory).run(terminal).await;
+    let keyboard_result = supports_keyboard_enhancement
+        .then(|| execute!(stdout(), PopKeyboardEnhancementFlags))
+        .transpose();
+    let input_result = execute!(stdout(), DisableBracketedPaste, DisableMouseCapture);
     ratatui::restore();
+    keyboard_result?;
     input_result?;
     result
 }
