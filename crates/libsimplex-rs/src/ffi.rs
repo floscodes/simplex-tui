@@ -118,7 +118,20 @@ impl SimplexApi {
             path: path.to_path_buf(),
             source,
         })?;
-        #[cfg(not(unix))]
+        #[cfg(windows)]
+        let library: Library = unsafe {
+            libloading::os::windows::Library::load_with_flags(
+                path,
+                libloading::os::windows::LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR
+                    | libloading::os::windows::LOAD_LIBRARY_SEARCH_DEFAULT_DIRS,
+            )
+        }
+        .map(Into::into)
+        .map_err(|source| SimplexError::LoadLibrary {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        #[cfg(not(any(unix, windows)))]
         let library =
             unsafe { Library::new(path) }.map_err(|source| SimplexError::LoadLibrary {
                 path: path.to_path_buf(),
