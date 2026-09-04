@@ -1,6 +1,6 @@
 # simplex-tui
 
-## The SimpleX client in your terminal.
+## An independent SimpleX-client in your terminal.
 
 <p align="center">
   <img src="./screenshot.png" alt="simplex-tui chat interface" width="900">
