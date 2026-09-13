@@ -4,6 +4,7 @@
 //! details of this crate. Consumers interact only with Rust data types,
 //! commands and events.
 
+pub mod agent;
 pub mod auth;
 mod client;
 pub mod encrypted;
@@ -11,6 +12,8 @@ mod ffi;
 pub mod handshake;
 mod model;
 pub mod protocol;
+pub mod queue;
+pub mod smp;
 pub mod tls;
 pub mod transport;
 

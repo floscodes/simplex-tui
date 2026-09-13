@@ -4,13 +4,16 @@ use std::io;
 
 use openssl::{
     derive::Deriver,
-    pkey::{Id, PKey, Private, Public},
+    pkey::{Id, PKey, PKeyRef, Private, Public},
 };
 use thiserror::Error;
 
 use crate::{
+    agent::{ResponseRouter, RoutedTransmission},
     auth::{AuthError, VerifiedDhKey},
     encrypted::{EncryptedBlockError, SmpBlockCipher},
+    queue::{self, SubscriptionMode},
+    smp::{self, ClientCommand, OwnedTransmission, RawTransmission, SmpWireError},
     tls::SmpTlsStream,
     transport::{ServerHello, ServerHelloError, SmpVersionRange, read_smp_block, write_smp_block},
 };
@@ -31,6 +34,8 @@ pub enum HandshakeError {
     UnsupportedLegacyVersion,
     #[error("SMP block key initialization failed: {0}")]
     BlockCipher(#[from] EncryptedBlockError),
+    #[error("SMP transmission encoding failed: {0}")]
+    Wire(#[from] SmpWireError),
 }
 
 /// Result of the initial handshake. Further SMP traffic requires the agent
@@ -39,6 +44,7 @@ pub struct SmpHandshake {
     stream: SmpTlsStream,
     pub version: u16,
     shared_secret: Vec<u8>,
+    server_dh_key: PKey<Public>,
     block_cipher: Option<SmpBlockCipher>,
 }
 
@@ -60,6 +66,118 @@ impl SmpHandshake {
             Some(cipher) => cipher.read_block(&mut self.stream)?,
             None => read_smp_block(&mut self.stream)?,
         })
+    }
+
+    /// Send the unauthenticated SMP keepalive using the negotiated session
+    /// framing. The caller supplies a correlation ID to match its reply.
+    pub fn send_ping(&mut self, correlation_id: &[u8]) -> Result<(), HandshakeError> {
+        let raw = RawTransmission {
+            authenticator: b"",
+            service_signature: None,
+            session_id: self.stream.tls_unique(),
+            correlation_id,
+            entity_id: b"",
+            command: b"PING",
+        };
+        let transmission = smp::encode_transmission(raw, self.version >= 7, self.version >= 16)?;
+        let batch = smp::encode_batch(&[transmission])?;
+        self.send_block(&batch)
+    }
+
+    /// Send a signed base `NEW` request. The caller owns the generated keys
+    /// and must persist them together with the eventual `IDS` reply.
+    pub fn send_new_queue(
+        &mut self,
+        correlation_id: &[u8],
+        recipient_auth_key: &PKeyRef<Private>,
+        recipient_dh_key: &PKeyRef<Public>,
+        subscription: SubscriptionMode,
+    ) -> Result<(), HandshakeError> {
+        let transmission = queue::sign_new_queue(
+            self.version,
+            self.stream.tls_unique(),
+            correlation_id,
+            recipient_auth_key,
+            recipient_dh_key,
+            subscription,
+        )?;
+        let batch = smp::encode_batch(&[transmission])?;
+        self.send_block(&batch)
+    }
+
+    /// Send an entity-authorized queue command with an Ed25519/Ed448 key.
+    /// The caller must use the key registered for `entity_id` and a unique
+    /// correlation ID for each in-flight request.
+    pub fn send_signed_queue_command(
+        &mut self,
+        correlation_id: &[u8],
+        entity_id: &[u8],
+        command: ClientCommand<'_>,
+        key: &PKeyRef<Private>,
+    ) -> Result<(), HandshakeError> {
+        if entity_id.is_empty() || matches!(command, ClientCommand::Ping) {
+            return Err(SmpWireError::InvalidAuthentication.into());
+        }
+        let transmission = smp::sign_transmission(
+            self.stream.tls_unique(),
+            correlation_id,
+            entity_id,
+            command,
+            key,
+            self.version >= 7,
+            self.version >= 16,
+        )?;
+        self.send_block(&smp::encode_batch(&[transmission])?)
+    }
+
+    /// Send a queue command authenticated with the registered X25519 key and
+    /// the server key validated during the handshake.
+    pub fn send_x25519_queue_command(
+        &mut self,
+        correlation_id: &[u8],
+        entity_id: &[u8],
+        command: ClientCommand<'_>,
+        key: &PKeyRef<Private>,
+    ) -> Result<(), HandshakeError> {
+        if entity_id.is_empty() || matches!(command, ClientCommand::Ping) {
+            return Err(SmpWireError::InvalidAuthentication.into());
+        }
+        let transmission = smp::X25519TransmissionAuthenticator {
+            private_key: key,
+            peer_key: &self.server_dh_key,
+            imply_session_id: self.version >= 7,
+            service_auth: self.version >= 16,
+        }
+        .authenticate(self.stream.tls_unique(), correlation_id, entity_id, command)?;
+        self.send_block(&smp::encode_batch(&[transmission])?)
+    }
+
+    /// Decode all transmissions in the next SMP transport block. Command
+    /// bodies remain raw because the agent must handle asynchronous responses.
+    pub fn receive_transmissions(&mut self) -> Result<Vec<OwnedTransmission>, HandshakeError> {
+        let block = self.receive_block()?;
+        let batch = smp::parse_batch(&block)?;
+        batch
+            .into_iter()
+            .map(|bytes| {
+                smp::parse_transmission(
+                    bytes,
+                    self.stream.tls_unique(),
+                    self.version >= 7,
+                    self.version >= 16,
+                )
+                .map(OwnedTransmission::from)
+                .map_err(HandshakeError::from)
+            })
+            .collect()
+    }
+
+    /// Read one batch and classify each item against outstanding requests.
+    pub fn receive_routed(
+        &mut self,
+        router: &mut ResponseRouter,
+    ) -> Result<Vec<RoutedTransmission>, HandshakeError> {
+        Ok(router.route_batch(self.receive_transmissions()?))
     }
 }
 
@@ -109,6 +227,7 @@ pub fn complete_smp_handshake(
         stream,
         version,
         shared_secret,
+        server_dh_key: peer_key,
         block_cipher,
     })
 }
@@ -233,6 +352,15 @@ mod tests {
         acceptor.add_extra_chain_cert(identity.clone()).unwrap();
         acceptor.check_private_key().unwrap();
         let acceptor = acceptor.build();
+        let queue_auth = PKey::generate_ed25519().unwrap();
+        let queue_auth_public =
+            PKey::public_key_from_der(&queue_auth.public_key_to_der().unwrap()).unwrap();
+        let queue_dh = PKey::generate_x25519().unwrap();
+        let queue_dh_public =
+            PKey::public_key_from_der(&queue_dh.public_key_to_der().unwrap()).unwrap();
+        let queue_x25519_auth = PKey::generate_x25519().unwrap();
+        let queue_x25519_public =
+            PKey::public_key_from_der(&queue_x25519_auth.public_key_to_der().unwrap()).unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let server = thread::spawn(move || {
@@ -271,6 +399,117 @@ mod tests {
                 SmpBlockCipher::for_server(&session[..session_len], &shared_secret).unwrap();
             cipher.write_block(&mut tls, b"relay-ready").unwrap();
             assert_eq!(cipher.read_block(&mut tls).unwrap(), b"client-ready");
+            let ping_batch = cipher.read_block(&mut tls).unwrap();
+            let ping = crate::smp::parse_batch(&ping_batch).unwrap();
+            assert_eq!(ping.len(), 1);
+            let ping = crate::smp::parse_transmission(ping[0], &session[..session_len], true, true)
+                .unwrap();
+            assert_eq!(ping.correlation_id, b"ping-1");
+            assert_eq!(ping.command, b"PING");
+            let pong = crate::smp::encode_transmission(
+                crate::smp::RawTransmission {
+                    authenticator: b"",
+                    service_signature: None,
+                    session_id: &session[..session_len],
+                    correlation_id: b"ping-1",
+                    entity_id: b"",
+                    command: b"PONG",
+                },
+                true,
+                true,
+            )
+            .unwrap();
+            cipher
+                .write_block(&mut tls, &crate::smp::encode_batch(&[pong]).unwrap())
+                .unwrap();
+            let new_batch = cipher.read_block(&mut tls).unwrap();
+            let new_batch = crate::smp::parse_batch(&new_batch).unwrap();
+            assert_eq!(new_batch.len(), 1);
+            let new_queue =
+                crate::smp::parse_transmission(new_batch[0], &session[..session_len], true, true)
+                    .unwrap();
+            assert_eq!(new_queue.entity_id, b"");
+            assert_eq!(new_queue.correlation_id, b"new-1");
+            assert!(new_queue.command.starts_with(b"NEW "));
+            assert_eq!(
+                crate::smp::verify_transmission_signature(new_queue, &queue_auth_public),
+                Ok(true)
+            );
+            let mut ids = b"IDS ".to_vec();
+            crate::smp::put_short(&mut ids, b"recipient-id").unwrap();
+            crate::smp::put_short(&mut ids, b"sender-id").unwrap();
+            crate::smp::put_short(&mut ids, &dh_key.public_key_to_der().unwrap()).unwrap();
+            ids.extend_from_slice(b"0000");
+            let ids = crate::smp::encode_transmission(
+                crate::smp::RawTransmission {
+                    authenticator: b"",
+                    service_signature: None,
+                    session_id: &session[..session_len],
+                    correlation_id: b"new-1",
+                    entity_id: b"",
+                    command: &ids,
+                },
+                true,
+                true,
+            )
+            .unwrap();
+            cipher
+                .write_block(&mut tls, &crate::smp::encode_batch(&[ids]).unwrap())
+                .unwrap();
+            for (expected_corr, expected_command) in [
+                (b"sub-1".as_slice(), b"SUB".as_slice()),
+                (b"get-1".as_slice(), b"GET".as_slice()),
+            ] {
+                let batch = cipher.read_block(&mut tls).unwrap();
+                let batch = crate::smp::parse_batch(&batch).unwrap();
+                assert_eq!(batch.len(), 1);
+                let request =
+                    crate::smp::parse_transmission(batch[0], &session[..session_len], true, true)
+                        .unwrap();
+                assert_eq!(request.correlation_id, expected_corr);
+                assert_eq!(request.entity_id, b"recipient-id");
+                assert_eq!(request.command, expected_command);
+                let verified = if expected_command == b"SUB" {
+                    crate::smp::verify_transmission_signature(request, &queue_auth_public)
+                } else {
+                    crate::smp::verify_x25519_authenticator(request, &dh_key, &queue_x25519_public)
+                };
+                assert_eq!(verified, Ok(true));
+                let ok = crate::smp::encode_transmission(
+                    crate::smp::RawTransmission {
+                        authenticator: b"",
+                        service_signature: None,
+                        session_id: &session[..session_len],
+                        correlation_id: expected_corr,
+                        entity_id: b"recipient-id",
+                        command: b"OK",
+                    },
+                    true,
+                    true,
+                )
+                .unwrap();
+                cipher
+                    .write_block(&mut tls, &crate::smp::encode_batch(&[ok]).unwrap())
+                    .unwrap();
+                if expected_command == b"SUB" {
+                    let event = crate::smp::encode_transmission(
+                        crate::smp::RawTransmission {
+                            authenticator: b"",
+                            service_signature: None,
+                            session_id: &session[..session_len],
+                            correlation_id: b"",
+                            entity_id: b"recipient-id",
+                            command: b"MSG \x03msgciphertext",
+                        },
+                        true,
+                        true,
+                    )
+                    .unwrap();
+                    cipher
+                        .write_block(&mut tls, &crate::smp::encode_batch(&[event]).unwrap())
+                        .unwrap();
+                }
+            }
         });
 
         let tcp = TcpStream::connect(address).unwrap();
@@ -282,6 +521,63 @@ mod tests {
         assert_eq!(handshake.shared_secret().len(), 32);
         assert_eq!(handshake.receive_block().unwrap(), b"relay-ready");
         handshake.send_block(b"client-ready").unwrap();
+        handshake.send_ping(b"ping-1").unwrap();
+        let replies = handshake.receive_transmissions().unwrap();
+        assert_eq!(replies.len(), 1);
+        assert_eq!(replies[0].correlation_id, b"ping-1");
+        assert_eq!(
+            crate::smp::BrokerResponse::parse(&replies[0].command),
+            Ok(crate::smp::BrokerResponse::Pong)
+        );
+        handshake
+            .send_new_queue(
+                b"new-1",
+                &queue_auth,
+                &queue_dh_public,
+                SubscriptionMode::CreateOnly,
+            )
+            .unwrap();
+        let ids_reply = handshake.receive_transmissions().unwrap();
+        assert_eq!(ids_reply.len(), 1);
+        let ids = crate::queue::parse_queue_ids(handshake.version, &ids_reply[0].command).unwrap();
+        assert_eq!(ids.recipient_id, b"recipient-id");
+        assert_eq!(ids.sender_id, b"sender-id");
+        let mut router = ResponseRouter::new();
+        router.register(b"sub-1", b"recipient-id", b"SUB").unwrap();
+        handshake
+            .send_signed_queue_command(
+                b"sub-1",
+                b"recipient-id",
+                ClientCommand::Subscribe,
+                &queue_auth,
+            )
+            .unwrap();
+        let reply = handshake.receive_routed(&mut router).unwrap();
+        assert!(
+            matches!(&reply[0], RoutedTransmission::Response { request, transmission }
+            if request.command == b"SUB" && transmission.correlation_id == b"sub-1"
+                && crate::smp::BrokerResponse::parse(&transmission.command) == Ok(crate::smp::BrokerResponse::Ok))
+        );
+        let event = handshake.receive_routed(&mut router).unwrap();
+        assert!(matches!(&event[0], RoutedTransmission::Event(transmission)
+            if transmission.entity_id == b"recipient-id"
+                && crate::smp::BrokerResponse::parse(&transmission.command)
+                    == Ok(crate::smp::BrokerResponse::Message { message_id: b"msg", body: b"ciphertext" })));
+        router.register(b"get-1", b"recipient-id", b"GET").unwrap();
+        handshake
+            .send_x25519_queue_command(
+                b"get-1",
+                b"recipient-id",
+                ClientCommand::Get,
+                &queue_x25519_auth,
+            )
+            .unwrap();
+        let reply = handshake.receive_routed(&mut router).unwrap();
+        assert!(
+            matches!(&reply[0], RoutedTransmission::Response { request, transmission }
+            if request.command == b"GET" && transmission.correlation_id == b"get-1"
+                && crate::smp::BrokerResponse::parse(&transmission.command) == Ok(crate::smp::BrokerResponse::Ok))
+        );
         server.join().unwrap();
     }
 }

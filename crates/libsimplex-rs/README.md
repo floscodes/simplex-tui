@@ -16,6 +16,17 @@ establishes a TLS stream after validating the pinned identity and certificate
 chain. The `auth` and `handshake` modules verify the signed server key, exchange
 an ephemeral DH key, and send the versioned client hello. Encrypted transport
 blocks are implemented in `encrypted`. The messaging agent is still missing.
+The `smp` module handles raw transmission fields, encrypted transport batch
+framing, and a typed subset of commands and responses for message flow.
+Ed25519/Ed448 entity signatures and v16+ dual-signed service subscriptions
+are supported. X25519 queue authenticators are implemented. `NEW` can be
+encoded and signed, and `IDS` parsed across supported SMP versions. Queue
+persistence, retries, and agent behavior remain unimplemented.
+The handshake connection can exchange batched `PING`, signed `NEW`, and
+authenticated queue commands with raw responses. A local TLS relay test covers
+`PING`, `NEW`/`IDS`, signed `SUB`, and X25519-authenticated `GET` through
+encrypted SMP blocks. An in-memory response router separates asynchronous
+`MSG` events from replies and checks their correlation and entity IDs.
 
 A complete native client requires compatible implementations of those layers
 and interoperability tests against the pinned upstream release before the ABI

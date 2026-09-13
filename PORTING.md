@@ -22,10 +22,26 @@ the controller's JSON in Rust, but `Simplex.Chat.Mobile` still owns the client.
 - `crates/libsimplex-rs/src/tls.rs`: TLS stream with pinned identity and
   certificate-chain validation, ALPN, and TLS channel binding.
 - `crates/libsimplex-rs/src/handshake.rs`: authenticated initial SMP handshake,
-  ephemeral X25519/X448 key exchange, and versioned client hello.
+  ephemeral X25519/X448 key exchange, versioned client hello, and batched
+  `PING`/`NEW` requests plus signed or X25519-authenticated queue commands
+  with raw responses over the resulting connection. A local TLS relay test
+  exercises `PING`, `NEW`/`IDS`, `SUB`, and `GET`.
 - `crates/libsimplex-rs/src/encrypted.rs`: SMP v11+ XSalsa20-Poly1305 blocks
-  with HKDF-SHA-512 send/receive chains. SMP commands, subscriptions, and
-  agent state are not ported.
+  with HKDF-SHA-512 send/receive chains.
+- `crates/libsimplex-rs/src/smp.rs`: raw SMP transmission fields and
+  transport batch framing, plus a typed subset of client commands (`PING`,
+  `SUB`, `GET`, `ACK`, `SEND`) and broker responses (`PONG`, `OK`, `END`,
+  `DELD`, `MSG`, `ERR`). It can sign and verify Ed25519/Ed448 entity
+  transmissions and dual-sign v16+ service subscriptions with a pinned
+  service-certificate hash. X25519 queue authenticators (DH plus
+  XSalsa20-Poly1305 over SHA-512) are also implemented.
+- `crates/libsimplex-rs/src/queue.rs`: versioned `NEW` queue request encoding,
+  signed creator transmission with Ed25519/Ed448, and `IDS` response parsing.
+  Queue persistence, retries, subscription management, and agent state are
+  not ported.
+- `crates/libsimplex-rs/src/agent.rs`: in-memory correlation of replies with
+  pending requests, entity-ID checks, and separation of asynchronous events.
+  The local relay test interleaves a `MSG` event with command responses.
 - `vendor/simplex-chat/src/Simplex/Chat/Mobile.hs`: ABI entry point.
 - `vendor/simplex-chat/src/Simplex/Chat/Controller.hs` and `Library/`: chat
   behavior and command handling.
