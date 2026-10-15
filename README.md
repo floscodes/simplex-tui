@@ -2,6 +2,11 @@
 
 ## A SimpleX-client in your terminal.
 
+simplex-tui uses the original SMP (SimpleX Messaging Protocol) implementation
+from the official SimpleX libraries. This project provides a terminal UI around
+those libraries; it does not reimplement SMP or introduce a separate messaging
+protocol.
+
 <p align="center">
   <img src="./screenshot.png" alt="simplex-tui chat interface" width="900">
 </p>
