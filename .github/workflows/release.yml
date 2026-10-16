@@ -38,7 +38,7 @@ jobs:
           cp vendor/libsimplex/*.so "$package/"
           tar -C dist -czf "dist/$ASSET.tar.gz" "$ASSET"
           (cd dist && sha256sum "$ASSET.tar.gz" > "$ASSET.tar.gz.sha256")
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: release-linux
           path: |
@@ -70,7 +70,7 @@ jobs:
           mkdir -p dist
           cp target/release/simplex-tui "dist/simplex-tui-$ARCH"
           cp vendor/libsimplex/libsimplex.dylib "dist/libsimplex-$ARCH.dylib"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: raw-macos-${{ matrix.arch }}
           path: dist/*
@@ -99,7 +99,7 @@ jobs:
           cp README.md LICENSE "$package/"
           tar -C dist -czf "dist/$asset.tar.gz" "$asset"
           (cd dist && shasum -a 256 "$asset.tar.gz" > "$asset.tar.gz.sha256")
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: release-macos
           path: |
@@ -131,7 +131,7 @@ jobs:
           Compress-Archive -Path $Package -DestinationPath $Archive
           $Hash = (Get-FileHash -Algorithm SHA256 $Archive).Hash.ToLowerInvariant()
           "$Hash  $Asset.zip" | Set-Content -NoNewline "$Archive.sha256"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: release-windows
           path: |
